@@ -7,9 +7,29 @@
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path, PurePath
 
 from .errors import UnsafePathError
+
+
+def reject_linked_path(path: str | Path) -> None:
+    """Reject links/reparse points in the lexical target and every existing ancestor.
+
+    Do not resolve first: that hides the link. lstat supports NTFS junctions on 3.11.
+    This is a preflight containment check, not a filesystem TOCTOU lock.
+    """
+    target = Path(path).absolute()
+    for item in [target, *target.parents]:
+        try:
+            info = item.lstat()
+        except FileNotFoundError:
+            continue
+        if (stat.S_ISLNK(info.st_mode)
+                or (os.name == 'nt' and (
+                    info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+                    or info.st_reparse_tag))):
+            raise UnsafePathError('Linked transaction path')
 
 
 def safe_join(root: str | Path, relative: str | PurePath) -> Path:

@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from .errors import UnsafePathError
+from .safepath import reject_linked_path
 
 
 def owned_path(root: Path, name: str) -> Path:
@@ -21,17 +22,13 @@ def owned_path(root: Path, name: str) -> Path:
                    or p.casefold() in {'.git', 'git~1', '.gitsync-py.lock'} for p in parts)):
         raise UnsafePathError('Unsafe transaction path')
     target = root.joinpath(*parts)
+    reject_linked_path(target)
     for item in [root, *target.parents, target]:
         try:
             info = item.lstat()  # Python 3.11 has no Path.is_junction().
         except FileNotFoundError:
             continue
-        if (stat.S_ISLNK(info.st_mode)
-                or (os.name == 'nt' and (
-                    info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
-                    or info.st_reparse_tag))):
-            # Reject all Windows reparse points, including junction/mount-point parents.
-            raise UnsafePathError('Linked transaction path')
+
         if (stat.S_ISDIR(info.st_mode)
                 and item.name.casefold() in {'version', 'authors', '.gitignore', '.gitattributes'}):
             raise UnsafePathError('File-only service path used as directory')

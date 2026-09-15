@@ -67,4 +67,3 @@ def test_clone_file_url_preserves_custom_metadata_and_init_resume(tmp_path, fixt
     assert _git(work, 'rev-parse', 'HEAD~1').strip() == head
     assert _git(work, 'log', '-1', '--format=%an|%ae').strip() == 'Custom|custom@example.org'
     assert (work / 'src' / 'AUTHORS').read_bytes() == authors
-

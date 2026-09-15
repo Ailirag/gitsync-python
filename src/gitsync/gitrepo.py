@@ -16,6 +16,7 @@ import subprocess
 from pathlib import Path
 
 from .errors import DirtyWorkingCopyError, GitSyncError
+from .safepath import reject_linked_path
 
 log = logging.getLogger("gitsync.git")
 
@@ -99,6 +100,7 @@ class GitRepo:
 
     def clone(self, url: str) -> None:
         """Explicit Git clone; failures do not disclose the remote URL or credentials."""
+        reject_linked_path(self.path)
         if self.path.is_symlink() or (self.path.exists() and (
                 not self.path.is_dir() or any(self.path.iterdir()))):
             raise GitSyncError("Refusing nonempty destination (or link/file)")

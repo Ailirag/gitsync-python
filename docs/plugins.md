@@ -47,6 +47,14 @@ Callbacks одного host сериализованы RLock. Export callbacks �
 | `after_sync` | `work_dir`, `result` | Только успешное завершение, в том числе no-op. Ошибка возвращается, уже сделанные commits не откатываются. Не является finally/cleanup callback. |
 
 История может запрашиваться повторно с start=1 для проверки усечения storage при no-op.
+Очистка ядра выполняется в защищённом finally после остановки export pool, в том числе
+при ошибке `after_sync` и при no-op. Удаляются только созданные этим run каталоги и
+ресурсы backend через его `cleanup()`, не общий temp parent. Ошибка `after_sync` сохраняется
+как исходный объект исключения; `post_commit=True`, если этот запуск подтвердил commits.
+Ошибки отдельных cleanup действий не прерывают остальные: при уже имеющейся ошибке они
+добавляются в `__notes__` и журнал предупреждений, иначе становятся ошибкой результата.
+`--keep-temp` (`cleanup_temp=False`) явно сохраняет **и run exports, и backend resources**,
+включая ошибочные и no-op запуски: автоматический backend cleanup также отключён.
 Init генерирует AUTHORS обычным backend.fetch_history, lifecycle выше относится к sync.
 Пустой/missing override snapshot подчиняется тому же allows_empty_export контракту backend.
 Reserved-path validation повторяется перед построением транзакции; baseline проверяется

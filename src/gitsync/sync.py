@@ -25,6 +25,7 @@ import shutil
 import threading
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath
 
@@ -85,7 +86,7 @@ class SyncOptions:
     temp_root: Path | str | None = None
     email_domain: str = "localhost"
     min_version_gap: int = DEFAULT_MIN_VERSION_GAP
-    cleanup_temp: bool = True
+    cleanup_temp: bool = True  # False keeps both run exports and backend-owned resources.
     lock_timeout: float = 30.0
     limit: int | None = None
     allow_dirty: bool = False
@@ -99,7 +100,7 @@ class SyncResult:
     error: BaseException | None = None
     cancelled: bool = False
     max_inflight: int = 0
-    #: Ошибка возникла ПОСЛЕ успешного коммита (обработчик after_commit): коммит и маркер целы.
+    #: Post-commit notification/cleanup failure: подтверждённые коммиты и маркер целы.
     post_commit: bool = False
     #: Версии, снятые при старте как незавершённые транзакции предыдущего запуска.
     rolled_back: list[int] = field(default_factory=list)
@@ -597,7 +598,8 @@ class SyncManager:
         self.sync_dir.mkdir(parents=True, exist_ok=True)
 
         lock_path = self._git_dir() / LOCK_FILE_NAME
-        with exclusive_lock(lock_path, timeout=self.options.lock_timeout):
+        with (exclusive_lock(lock_path, timeout=self.options.lock_timeout),
+              self._run_resources(result) as run_dirs):
             # Незавершённая транзакция прошлого запуска снимается ДО проверки грязной копии:
             # иначе собственные недописанные файлы выглядят как чужие правки.
             self._reconcile_journal(result)
@@ -634,6 +636,7 @@ class SyncManager:
             self._baseline = self._target_state()
             authors = read_authors_file(self.sync_dir / AUTHORS_FILE_NAME)
             temp_root = self._temp_root()
+            run_dirs.append(temp_root)
             window = max(self.options.jobs, 1) + max(self.options.queue_limit, 0)
 
             futures: dict[int, Future[Path]] = {}
@@ -723,13 +726,38 @@ class SyncManager:
                         leftover.cancel()
 
             if result.ok:
-                self.plugins.emit("after_sync", work_dir=self.sync_dir, result=result)
+                try:
+                    self.plugins.emit("after_sync", work_dir=self.sync_dir, result=result)
+                except BaseException:
+                    result.post_commit = bool(result.committed)
+                    raise
+
+    @contextmanager
+    def _run_resources(self, result: SyncResult):
+        """Owned run/backend cleanup after pool shutdown, even on callback failure."""
+        run_dirs = []
+        try:
+            yield run_dirs
+        except BaseException as exc:
+            if result.error is None:
+                result.error = exc
+            raise
+        finally:
             if self.options.cleanup_temp:
-                # Удаляется только собственный run-каталог: родитель может быть общим.
-                shutil.rmtree(temp_root, ignore_errors=True)
+                actions = [(shutil.rmtree, (root,)) for root in run_dirs]
                 cleanup = getattr(self.backend, "cleanup", None)
                 if callable(cleanup):
-                    cleanup()
+                    actions.append((cleanup, ()))
+                for action, args in actions:
+                    try:
+                        action(*args)
+                    except Exception as exc:  # cleanup steps are independent
+                        if result.error is None:
+                            result.error = exc
+                            result.post_commit = bool(result.committed)
+                        else:
+                            result.error.add_note(f'Additional cleanup failure: {exc}')
+                        log.warning('Owned resource cleanup failed: %s', exc)
 
     # --- прочие команды ----------------------------------------------------
 
