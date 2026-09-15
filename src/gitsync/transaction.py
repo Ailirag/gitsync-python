@@ -22,8 +22,22 @@ def owned_path(root: Path, name: str) -> Path:
         raise UnsafePathError('Unsafe transaction path')
     target = root.joinpath(*parts)
     for item in [root, *target.parents, target]:
-        if item.is_symlink() or (item.exists() and getattr(item, 'is_junction', lambda: False)()):
+        try:
+            info = item.lstat()  # Python 3.11 has no Path.is_junction().
+        except FileNotFoundError:
+            continue
+        if (stat.S_ISLNK(info.st_mode)
+                or (os.name == 'nt' and (
+                    info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+                    or info.st_reparse_tag))):
+            # Reject all Windows reparse points, including junction/mount-point parents.
             raise UnsafePathError('Linked transaction path')
+        if (stat.S_ISDIR(info.st_mode)
+                and item.name.casefold() in {'version', 'authors', '.gitignore', '.gitattributes'}):
+            raise UnsafePathError('File-only service path used as directory')
+    if any(p.casefold() in {'version', 'authors', '.gitignore', '.gitattributes'}
+           for p in parts[:-1]):
+        raise UnsafePathError('File-only service path used as directory')
     return target
 
 

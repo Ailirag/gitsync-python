@@ -135,11 +135,12 @@ class GitRepo:
         expected_head: str | None = None,
         prepared=None,
         lock_token: str | None = None,
+        apply=None,
     ) -> str | None:
         """Legacy explicit all-files commit, or a content-bound isolated transaction."""
         if records is not None:
             return self._commit_scoped(message, author, date, committer, records,
-                                       expected_head, prepared, lock_token)
+                                       expected_head, prepared, lock_token, apply)
         self.run(["add", "-A", "."])
         if self.is_clean():
             log.debug("Нет изменений — коммит пропущен")
@@ -180,7 +181,8 @@ class GitRepo:
             )
         return self.head_sha()
 
-    def _commit_scoped(self, message, author, date, committer, records, head, prepared, lock_token):
+    def _commit_scoped(self, message, author, date, committer, records, head, prepared, lock_token,
+                       apply):
         import tempfile
 
         from .transaction import image, index_entries, locked_index, owned_path, update_entries
@@ -198,6 +200,9 @@ class GitRepo:
             for name, record in records.items():
                 if current.get(name) != record['index_before']:
                     raise GitSyncError(f'External staged edit: {name}')
+            if apply:
+                apply()  # WAL and marker mutation only after acquiring the real Git index lock.
+            for name, record in records.items():
                 if image(owned_path(self.path, name)) != record['after']:
                     raise GitSyncError(f'External worktree edit: {name}')
             # Tree starts from HEAD, not from the user's staged changes.

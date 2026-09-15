@@ -744,20 +744,64 @@ class SyncManager:
                 name = self._rel_to_repo(path)
                 owned_path(self.repo.path, name)
                 before = image(path)
-                head = self.repo.head_sha() if commit else None
-                index = index_entries(self.repo) if commit else {}
-                write_version_file(self.sync_dir, version)
-                if commit:
-                    after = image(path)
-                    record = {"before": before, "after": after,
-                              "index_before": index.get(name), "index_after": blob_entry(self.repo, after)}
-                    self.repo.commit_all(message=f"Установлена версия хранилища {version}",
-                                         author=author, records={name: record}, expected_head=head)
+                if not commit:
+                    # Explicit resume-marker edit is intentionally not a Git transaction.
+                    write_version_file(self.sync_dir, version)
+                else:
+                    self._commit_marker(version, author, name, before)
             return True
         except LockBusyError:
             if raise_on_error:
                 raise
             return False
+
+    def _commit_marker(self, version: int, author: str, name: str, before: dict | None):
+        """Marker-only transaction using sync's content-bound WAL and reconciliation."""
+        import base64
+
+        body = '<?xml version="1.0" encoding="UTF-8"?>\n' f'<VERSION>{version}</VERSION>\n'
+        after = {'data': base64.b64encode(body.encode()).decode(),
+                 'mode': 0o666 if os.name == 'nt' else 0o644}
+        record = {'before': before, 'after': after,
+                  'index_before': index_entries(self.repo).get(name),
+                  'index_after': blob_entry(self.repo, after)}
+        entry = {'schema': 2, 'repo': str(self.repo.path.resolve()), 'created_dirs': [],
+                 'sync_dir': str(self.sync_dir.resolve()), 'head': self.repo.head_sha(),
+                 'version': version, 'previous': read_version_file(self.sync_dir),
+                 'state': 'committing', 'files': {name: record}, 'lock_token': uuid.uuid4().hex}
+        self._validate_transaction(entry)
+        journal = self._journal()
+        wal_started = False
+
+        def apply():
+            nonlocal wal_started
+            if image(owned_path(self.repo.path, name)) != before:
+                raise UnsafePathError('External marker edit before write')
+            wal_started = True
+            journal.write(entry)
+            write_version_file(self.sync_dir, version)
+
+        def prepared(sha):
+            entry['sha'] = sha
+            journal.write(entry)
+
+        self.repo.last_commit_ack = None
+        try:
+            sha = self.repo.commit_all(message=f'Установлена версия хранилища {version}',
+                                       author=author, records=entry['files'], expected_head=entry['head'],
+                                       prepared=prepared, lock_token=entry['lock_token'], apply=apply)
+            entry.update(state='committed', sha=sha)
+            journal.write(entry)
+            journal.clear()
+        except Exception as exc:
+            if (self.repo.last_commit_ack
+                    or (entry.get('sha') and self.repo.head_sha() == entry['sha'])):
+                # The ref is the acknowledgement: never roll back a published commit.
+                raise PostCommitError(f'Commit durable; bookkeeping failed: {exc}') from exc
+            if wal_started:
+                self._rollback_to_confirmed(entry)
+                journal.clear()
+            raise
 
     def needs_sync(self) -> bool:
         self.sync_dir = self._resolve_sync_dir()
