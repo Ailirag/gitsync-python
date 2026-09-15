@@ -196,6 +196,12 @@ class SyncManager:
             history = sorted(self.backend.fetch_history(current + 1), key=lambda item: item.number)
             self.plugins.emit("after_history", history=history, current_version=current)
             maximum = max((item.number for item in history), default=0)
+            if not history and current > 0:
+                # История запрашивается от current+1, поэтому пустой ответ ничего не говорит о
+                # реальном максимуме: на живом стенде в журнале это «максимум в хранилище: 0».
+                # Порог «хранилище пересоздали» нельзя считать по отфильтрованной истории —
+                # берём полный отчёт (лишний вызов только когда новых версий нет).
+                maximum = max((item.number for item in self.backend.fetch_history(1)), default=0)
             log.info("Синхронизированная версия: %s, максимум в хранилище: %s", current, maximum)
 
             if current + 1 > maximum and (current + 1 - maximum) > self.options.min_version_gap:

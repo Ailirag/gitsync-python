@@ -257,3 +257,36 @@ def test_symlink_in_export_is_not_followed(work_dir, tmp_path):
             (work_dir / "ссылка.xml").read_text(encoding="utf-8") != "секретные данные"
         )
     assert outside.read_text(encoding="utf-8") == "секретные данные"
+
+
+def test_resume_does_not_mistake_empty_range_for_recreated_storage(tmp_path):
+    """Дошли до версии 20, новых нет — это не «хранилище пересоздали».
+
+    Бэкенд отдаёт историю от запрошенного номера, поэтому при resume отфильтрованный максимум
+    равен нулю. На живом стенде это видно в журнале: «максимум в хранилище: 0». Порог
+    расхождения нельзя считать по отфильтрованной истории.
+    """
+    work_dir = tmp_path / "рк"
+    backend = FakeStorageBackend(_versions(20))
+    options = SyncOptions(jobs=2, temp_root=tmp_path / "tmp")
+    SyncManager(work_dir, backend, options).sync()
+    assert read_version_file(work_dir) == 20
+
+    result = SyncManager(work_dir, backend, options).sync()
+
+    assert result.committed == []
+    assert GitRepo(work_dir).commit_count() == 20
+
+
+def test_recreated_storage_is_refused_even_when_range_is_empty(tmp_path):
+    """Хранилище заменили на короткое — отказ до записи, а не молчаливое «новых версий нет»."""
+    work_dir = tmp_path / "рк"
+    options = SyncOptions(jobs=2, temp_root=tmp_path / "tmp")
+    SyncManager(work_dir, FakeStorageBackend(_versions(20)), options).sync()
+
+    recreated = FakeStorageBackend(_versions(2))
+    with pytest.raises(StorageVersionMismatchError):
+        SyncManager(work_dir, recreated, options).sync()
+
+    assert GitRepo(work_dir).commit_count() == 20
+    assert read_version_file(work_dir) == 20
