@@ -24,6 +24,8 @@ from typing import Protocol
 
 from .designer import DesignerRunner, StorageAccess
 from .errors import CancelledError, GitSyncError, UnsafePathError
+from .locks import exclusive_lock
+from .repository_session import repository_session_path
 from .safepath import safe_join
 from .storage_report import StorageVersion, parse_storage_report
 
@@ -52,6 +54,7 @@ class NativeStorageBackend:
         ib_factory=None,
     ):
         self.access = access
+        self._session_path = repository_session_path(access)
         self.runner = runner
         self.temp_root = Path(temp_root)
         self.extension = extension
@@ -127,7 +130,8 @@ class NativeStorageBackend:
             self.access, report_path, begin=max(begin, 1), ib_connection=ib_connection,
             extension=self.extension,
         )
-        self.runner.run(args)
+        with exclusive_lock(self._session_path, timeout=self.runner.timeout):
+            self.runner.run(args)
         if not report_path.is_file() or report_path.stat().st_size == 0:
             raise GitSyncError(f"Конфигуратор не создал отчёт по версиям: {report_path}")
         return parse_storage_report(report_path.read_bytes())
@@ -147,9 +151,14 @@ class NativeStorageBackend:
 
         suffix = ".cfe" if self.extension else ".cf"
         cf_path = worker_dir / f"v{version}-{uuid.uuid4().hex}{suffix}"
-        self.runner.run(self.runner.build_dump_cfg_args(
-            self.access, version, cf_path, ib_connection, extension=self.extension
-        ))
+        # Same-login native sessions conflict even across separate private IBs.
+        # Hold the OS lock only until RepositoryDumpCfg exits, NOT through LoadCfg/XML.
+        with exclusive_lock(self._session_path, timeout=self.runner.timeout):
+            if cancel is not None and cancel.is_set():
+                raise CancelledError("Отменено при ожидании сессии хранилища")
+            self.runner.run(self.runner.build_dump_cfg_args(
+                self.access, version, cf_path, ib_connection, extension=self.extension
+            ))
         if not cf_path.is_file() or cf_path.stat().st_size == 0:
             raise GitSyncError(f"Конфигуратор не выгрузил версию {version} из хранилища: {cf_path}")
 
