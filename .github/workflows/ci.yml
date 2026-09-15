@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - name: Настроить Python
+        run: uv venv --python ${{ matrix.python-version }} .venv
+      - name: Установить пакет и зависимости разработки
+        run: uv pip install --python .venv -e ".[dev]"
+      - name: Настроить git для тестов
+        run: |
+          git config --global user.email "ci@example.org"
+          git config --global user.name "CI"
+          git config --global init.defaultBranch main
+      - name: Статические проверки
+        run: uv run --python .venv ruff check src tests
+      - name: Тесты
+        run: uv run --python .venv pytest -q
+      - name: Сборка пакета
+        run: uv build --out-dir dist .
