@@ -75,7 +75,7 @@ Upstream разбирает отчёт не сам, а библиотекой `v
 | Команда upstream | Назначение | gitsync-py | Статус |
 |---|---|---|---|
 | `gitsync init` | подготовка рабочей копии | `init` | есть |
-| `gitsync clone` | **git clone URL** + init + полная выгрузка | `clone` | частично: URL не принимается, выполняется init + sync без сетевых операций (см. §7 «Открытые швы») |
+| `gitsync clone` | **git clone URL** + подготовка AUTHORS/VERSION (не sync: КомандаClone.os:55–80) | `clone --url URL --workdir PATH` | есть: local path/file URL + обычные Git URL; непустая цель отклоняется, существующие src/AUTHORS/VERSION сохраняются; затем отдельный sync |
 | `gitsync sync` | догрузка новых версий | `sync` | есть (+`--disable-auto-src`) |
 | `gitsync setversion` | запись номера версии (`--commit`) | `set-version` (`--commit`, общая блокировка writer'а) | есть |
 | `gitsync all` | пакетная обработка нескольких хранилищ | `sync-all` (JSON-конфиг, `--name`, `disable`) | частично (JSON-схема своя; чужая схема отвергается явно, а не выполняется как ноль хранилищ) |
@@ -90,12 +90,12 @@ Upstream: `МенеджерПлагинов` + `МенеджерПодписок
 изменяемым флагом `СтандартнаяОбработка`, установка пакетов через `opm`, встроенные
 запакованные плагины (`bindata`), включение/отключение из CLI.
 
-gitsync-py: `plugins.PluginHost` — Python-модули с `register(host)` и тремя событиями
-(`after_history`, `before_commit`, `after_commit`) **без** подмены стандартной обработки.
-
-**Ограничения заявлены явно**: плагины OneScript (`.os`) не загружаются и не будут загружаться;
-подмена стандартной обработки (очистки каталога, выгрузки, чтения таблиц) не поддерживается;
-установка плагинов через `opm` не поддерживается. Паритет по плагинам не заявляется.
+gitsync-py: `plugins.PluginHost` — Python-модули с `register(host)`, девять событий,
+убывающий priority, mutable contextual API и overrides history/export/cleanup.
+Ошибки fail closed по умолчанию. Изменения author/message/date используются Git commit.
+Все операции ядра сохраняют transaction/reserved-path checks. Подробный контракт и
+ограничения: [plugins.md](plugins.md). Это семантическая адаптация ключевых стадий,
+**не полный drop-in паритет** всех 30+ событий и внешних OneScript-плагинов.
 
 ## 6. Чего нет в итерации 1
 
@@ -104,7 +104,8 @@ gitsync-py: `plugins.PluginHost` — Python-модули с `register(host)` и 
 * Метки/теги хранилища (`/ConfigurationRepositorySetLabel`).
 * Команды блокировки/фиксации объектов хранилища (`Lock`/`Unlock`/`Commit`).
 * Чтение конфигураций upstream в YAML/XML (`tests/fixtures/config.yaml`, `config.xml`).
-* Push/merge/tag/release — сознательно: сетевые операции git не выполняются вообще.
+* Автоматический remote sync без явно подключенного Python-плагина; tag/release.
+  Clone — явная Git операция; opt-in remote lifecycle проверен только на собственном local bare.
 
 ## 7. Безопасность, восстановление, открытые швы
 
@@ -124,7 +125,8 @@ gitsync-py: `plugins.PluginHost` — Python-модули с `register(host)` и 
 
 **Открытые швы (не закрыты в этой итерации, приёмкой не считаются):**
 
-* `clone` не принимает Git URL (upstream `КомандаClone` клонирует репозиторий). Сетевые операции git не выполняются вообще — это остаётся сознательным ограничением, но паритет по команде не заявляется.
-* Паритет плагинов не заявляется (§5): три события, без подмены стандартной обработки и приоритетов.
+* Clone закрыт по локальным Git fixtures и file URL; внешние HTTPS/SSH/auth не исполнялись.
+* Полная совместимость внешних OneScript-плагинов не заявляется (§5); native/IB contexts,
+  все 30+ события и готовый универсальный sync-remote package остаются отдельной работой.
 * Symlink-сценарии (`.gitignore` → внешний файл, файл блокировки → внешний файл) проверены только частично: на этом хосте нет прав на создание symlink (WinError 1314). Записи по ссылке предотвращены (`move_export_into_working_copy` снимает symlink перед записью, `exclusive_lock` отвергает symlink), но тест на стенде с правами не выполнен.
 * Native E2E расширений и повторный прогон основной конфигурации после этих правок — отдельная задача (см. `native-product-e2e-02.md`, `native-extension-stand.md`).

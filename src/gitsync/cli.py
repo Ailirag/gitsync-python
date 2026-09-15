@@ -21,6 +21,7 @@ from . import __version__
 from .backends import FixtureStorageBackend, NativeStorageBackend
 from .designer import DEFAULT_DESIGNER_TIMEOUT, DesignerRunner, StorageAccess
 from .errors import ConfigError, GitSyncError
+from .gitrepo import GitRepo
 from .plugins import PluginHost
 from .sync import SyncManager, SyncOptions
 
@@ -141,9 +142,8 @@ def _cmd_sync(args) -> int:
 
 
 def _cmd_clone(args) -> int:
-    manager = _make_manager(args)
-    manager.init_working_copy(generate_authors=not args.no_authors, raise_on_error=True)
-    return _cmd_sync(args)
+    GitRepo(args.workdir).clone(args.url)
+    return _cmd_init(args)
 
 
 def _cmd_set_version(args) -> int:
@@ -323,8 +323,9 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--no-authors", action="store_true", help="не генерировать файл AUTHORS")
     init.set_defaults(func=_cmd_init)
 
-    clone = sub.add_parser("clone", help="init + полная синхронизация хранилища с нуля")
+    clone = sub.add_parser("clone", help="git clone URL + подготовка AUTHORS/VERSION; затем sync")
     _add_common(clone)
+    clone.add_argument("--url", required=True, help="URL Git или путь к локальному репозиторию")
     clone.add_argument("--no-authors", action="store_true", help="не генерировать файл AUTHORS")
     clone.set_defaults(func=_cmd_clone)
 

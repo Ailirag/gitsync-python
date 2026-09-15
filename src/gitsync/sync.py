@@ -214,6 +214,8 @@ class SyncManager:
         if version_file_path(candidate).is_file():
             log.info("Обнаружена раскладка с подкаталогом src: работаю в %s", candidate)
             return candidate
+        if candidate.is_dir():
+            return candidate
         return self.work_dir
 
     def _git_dir(self) -> Path:
@@ -419,7 +421,11 @@ class SyncManager:
                 raise CancelledError(f"Выгрузка версии {version.number} отменена")
             dest = temp_root / f"v{version.number}-{uuid.uuid4().hex[:8]}"
             try:
-                self.backend.export_version(version.number, dest, cancel)
+                ctx = self.plugins.emit("before_export", version=version, destination=dest,
+                                        cancel=cancel, standard_processing=True)
+                if ctx.standard_processing:
+                    self.backend.export_version(version.number, dest, cancel)
+                self.plugins.emit("after_export", version=version, destination=dest)
                 self._verify_export(version, dest)
                 validate_export_tree(dest)
                 return dest
@@ -479,12 +485,17 @@ class SyncManager:
 
         if self._target_state() != self._baseline:
             raise UnsafePathError('Target changed during export; no files written')
+        cleanup = self.plugins.emit("before_cleanup", version=version, work_dir=self.sync_dir,
+                                    standard_processing=True)
+        if self._target_state() != self._baseline:
+            raise UnsafePathError('Target changed in cleanup hook; no transaction started')
+        validate_export_tree(export_dir)
         journal = self._journal()
         before_index = index_entries(self.repo)
         files = {}
         for path in self.sync_dir.rglob("*"):
             relative = path.relative_to(self.sync_dir)
-            if relative.parts[0] in SERVICE_NAMES:
+            if relative.parts[0] in SERVICE_NAMES or not cleanup.standard_processing:
                 continue
             if path.is_file() or path.is_symlink():
                 name = self._rel_to_repo(path)
@@ -533,18 +544,33 @@ class SyncManager:
         # Keep this explicit seam: a crash before marker is recoverable from the WAL.
         write_version_file(self.sync_dir, version.number)
         signature = author_signature(version.author, authors, self.options.email_domain)
-        self.plugins.emit("before_commit", version=version, work_dir=self.sync_dir, author=signature)
+        commit = self.plugins.emit("before_commit", version=version, work_dir=self.sync_dir,
+                                   author=signature,
+                                   context_values={"message": version.comment, "date": version.date})
         def prepared(sha):
             entry['sha'] = sha
             journal.write(entry)
 
-        sha = self.repo.commit_all(message=version.comment, author=signature, date=version.date,
+        sha = self.repo.commit_all(message=commit.message, author=commit.author, date=commit.date,
                                    records=files, expected_head=entry['head'], prepared=prepared,
                                    lock_token=entry['lock_token'])
         entry.update(state='committed', sha=sha)
         journal.write(entry)
         log.info("Версия %s зафиксирована (%s)", version.number, sha or "без изменений")
         return sha
+
+    def _fetch_history(self, start: int, current: int) -> list[StorageVersion]:
+        ctx = self.plugins.emit("before_history", start=start, current_version=current,
+                                history=None, standard_processing=True)
+        history = self.backend.fetch_history(ctx.start) if ctx.standard_processing else ctx.history
+        ctx = self.plugins.emit("after_history", history=history, current_version=current)
+        if ctx.history is None:
+            raise ExportIncompleteError("History override did not provide history")
+        history = list(ctx.history)
+        numbers = [item.number for item in history]
+        if len(numbers) != len(set(numbers)):
+            raise ExportIncompleteError("Duplicate history versions are not safe to export")
+        return sorted(history, key=lambda item: item.number)
 
     # --- основной сценарий ------------------------------------------------
 
@@ -572,19 +598,19 @@ class SyncManager:
             # Незавершённая транзакция прошлого запуска снимается ДО проверки грязной копии:
             # иначе собственные недописанные файлы выглядят как чужие правки.
             self._reconcile_journal(result)
+            self.plugins.emit("before_sync", work_dir=self.sync_dir)
             if not self.options.allow_dirty:
                 self.check_working_copy()
 
             current = self._read_marker()
-            history = sorted(self.backend.fetch_history(current + 1), key=lambda item: item.number)
-            self.plugins.emit("after_history", history=history, current_version=current)
+            history = self._fetch_history(current + 1, current)
             maximum = max((item.number for item in history), default=0)
             if not history and current > 0:
                 # История запрашивается от current+1, поэтому пустой ответ ничего не говорит о
                 # реальном максимуме: на живом стенде в журнале это «максимум в хранилище: 0».
                 # Порог «хранилище пересоздали» нельзя считать по отфильтрованной истории —
                 # берём полный отчёт (лишний вызов только когда новых версий нет).
-                maximum = max((item.number for item in self.backend.fetch_history(1)), default=0)
+                maximum = max((item.number for item in self._fetch_history(1, current)), default=0)
             log.info("Синхронизированная версия: %s, максимум в хранилище: %s", current, maximum)
 
             if current + 1 > maximum and (current + 1 - maximum) > self.options.min_version_gap:
@@ -599,6 +625,7 @@ class SyncManager:
                 pending = pending[: self.options.limit]
             if not pending:
                 log.info("Новых версий нет")
+                self.plugins.emit("after_sync", work_dir=self.sync_dir, result=result)
                 return
 
             self._baseline = self._target_state()
@@ -692,6 +719,8 @@ class SyncManager:
                     for leftover in futures.values():
                         leftover.cancel()
 
+            if result.ok:
+                self.plugins.emit("after_sync", work_dir=self.sync_dir, result=result)
             if self.options.cleanup_temp:
                 # Удаляется только собственный run-каталог: родитель может быть общим.
                 shutil.rmtree(temp_root, ignore_errors=True)

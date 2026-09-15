@@ -3,7 +3,7 @@
 Апстрим коммитит через gitrunner: ``git add -A .`` + ``git commit`` с явными author/committer
 и датой. Здесь то же самое, но дата и автор передаются через переменные окружения
 ``GIT_AUTHOR_*``/``GIT_COMMITTER_*``, чтобы не зависеть от разбора локали.
-Push и любые сетевые операции не выполняются — это осознанный контракт (как в upstream).
+Обычный sync не выполняет сетевых операций; clone — явно запрошенная операция Git.
 """
 
 from __future__ import annotations
@@ -96,6 +96,30 @@ class GitRepo:
         # коммита переставало совпадать с XML платформы. Настройка локальная — чужие
         # репозитории и глобальный конфиг не трогаем.
         self.run(["config", "core.autocrlf", "false"])
+
+    def clone(self, url: str) -> None:
+        """Explicit Git clone; failures do not disclose the remote URL or credentials."""
+        if self.path.is_symlink() or (self.path.exists() and (
+                not self.path.is_dir() or any(self.path.iterdir()))):
+            raise GitSyncError("Refusing nonempty destination (or link/file)")
+        from urllib.parse import urlsplit
+        from urllib.request import url2pathname
+
+        parsed = urlsplit(url)
+        if parsed.scheme == 'file' and parsed.netloc in ('', 'localhost'):
+            url = url2pathname(parsed.path)
+        elif Path(url).exists():
+            url = str(Path(url).absolute())
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(
+            [self.git_path, "-c", "core.autocrlf=false", "clone", "--", url, str(self.path.absolute())],
+            cwd=self.path.parent, capture_output=True, timeout=self.timeout,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}, check=False,
+        )
+        if result.returncode:
+            raise GitSyncError(f"git clone failed (exit {result.returncode}); destination retained")
+        self.run(["config", "core.autocrlf", "false"])
+        self.run(["config", "core.quotepath", "false"])
 
     def is_clean(self) -> bool:
         result = self.run(["status", "--porcelain", "--untracked-files=all"])
