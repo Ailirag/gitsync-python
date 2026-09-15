@@ -129,6 +129,41 @@ class DesignerRunner:
             args += ["-NEnd", str(end)]
         return args
 
+    def build_dump_cfg_args(
+        self,
+        access: StorageAccess,
+        version: int,
+        cf_path: str | Path,
+        ib_connection: str,
+        out_file: Path | None = None,
+    ) -> list[str]:
+        """Выгрузка версии хранилища в CF — проверенный на стенде путь чтения версии.
+
+        ``/ConfigurationRepositoryDumpCfg <файл> -v <номер>`` реально выполнен на 8.3.27.2130
+        для версий 1..4; хранилище при этом только читается (ни захвата, ни фиксации).
+        """
+        args = self.base_args(ib_connection, out_file)
+        args += self._storage_args(access)
+        args += ["/ConfigurationRepositoryDumpCfg", str(cf_path)]
+        # Порядок обязателен: без "-v" сразу после команды всегда приходит последняя версия.
+        if version and version > 0:
+            args += ["-v", str(version)]
+        return args
+
+    def build_load_cfg_args(
+        self,
+        cf_path: str | Path,
+        ib_connection: str,
+        extension: str | None = None,
+        out_file: Path | None = None,
+    ) -> list[str]:
+        """Загрузка CF в изолированную базу. ОТДЕЛЬНЫЙ запуск, см. ``build_dump_args``."""
+        args = self.base_args(ib_connection, out_file)
+        args += ["/LoadCfg", str(cf_path)]
+        if extension:
+            args += ["-Extension", extension]
+        return args
+
     def build_update_cfg_args(
         self,
         access: StorageAccess,
@@ -136,10 +171,15 @@ class DesignerRunner:
         ib_connection: str,
         out_file: Path | None = None,
     ) -> list[str]:
+        """Обновление привязанной к хранилищу ИБ до версии (путь upstream).
+
+        НЕ ИСПОЛЬЗУЕТСЯ по умолчанию: на непривязанной временной ИБ работоспособность
+        ``/ConfigurationRepositoryUpdateCfg`` на стенде не подтверждена, а привязка временной
+        базы к чужому хранилищу — запись в это хранилище. Оставлено для явного выбора.
+        """
         args = self.base_args(ib_connection, out_file)
         args += self._storage_args(access)
         args += ["/ConfigurationRepositoryUpdateCfg"]
-        # Порядок обязателен: без "-v" сразу после команды всегда приходит последняя версия.
         if version and version > 0:
             args += ["-v", str(version)]
         args += ["-force"]

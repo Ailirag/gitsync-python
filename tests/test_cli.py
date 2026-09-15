@@ -9,26 +9,21 @@ import sys
 import pytest
 
 from gitsync.cli import main
+from support.native_report import ReportVersion, build_report_mxl
 
-REPORT = """Отчет по версиям хранилища конфигурации
-
-Версия:                  1
-Пользователь:            Иванов
-Дата создания:           15.09.2026 10:20:30
-Комментарий:             Первая версия
-
-Версия:                  2
-Пользователь:            Петров
-Дата создания:           16.09.2026 08:00:00
-Комментарий:             Вторая версия
-"""
+REPORT = build_report_mxl(
+    [
+        ReportVersion(1, "Иванов", "15.09.2026", "10:20:30", "Первая версия"),
+        ReportVersion(2, "Петров", "16.09.2026", "08:00:00", "Вторая версия"),
+    ]
+)
 
 
 @pytest.fixture()
 def fixture_storage(tmp_path):
     root = tmp_path / "фикстура хранилища"
     root.mkdir()
-    (root / "report.txt").write_text(REPORT, encoding="utf-8")
+    (root / "report.mxl").write_bytes(REPORT)
     (root / "v1" / "Справочники").mkdir(parents=True)
     (root / "v1" / "Справочники" / "Товары.xml").write_text("<Товары v='1'/>", encoding="utf-8")
     (root / "v2" / "Справочники").mkdir(parents=True)

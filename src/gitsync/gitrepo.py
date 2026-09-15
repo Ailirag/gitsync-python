@@ -91,6 +91,11 @@ class GitRepo:
         self.run(["init", "-b", initial_branch])
         # Выгрузка 1С содержит кириллицу в именах — не даём git ломать их в выводе.
         self.run(["config", "core.quotepath", "false"])
+        # Выгрузка конфигуратора должна лежать в git побайтово. На машине с глобальным
+        # core.autocrlf=true (проверено на стенде) блоб терял по байту на строку, и дерево
+        # коммита переставало совпадать с XML платформы. Настройка локальная — чужие
+        # репозитории и глобальный конфиг не трогаем.
+        self.run(["config", "core.autocrlf", "false"])
 
     def is_clean(self) -> bool:
         result = self.run(["status", "--porcelain", "--untracked-files=all"])

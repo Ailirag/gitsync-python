@@ -148,3 +148,25 @@ def test_exclusive_lock_serializes_threads(tmp_path):
         order.append("первый")
     thread.join(timeout=5)
     assert order == ["первый", "второй"]
+
+
+def test_init_stores_configurator_output_byte_exactly(tmp_path):
+    """Выгрузка 1С должна лежать в git побайтово.
+
+    На стенде Cerebro глобальный `core.autocrlf=true`: блоб коммита терял по одному байту на
+    строку (1236 против 1251 у файла конфигуратора). Репозиторий, который создаём мы, обязан
+    отключать конвертацию переводов строк локально, не трогая настройки машины.
+    """
+    repo = GitRepo(tmp_path / "рк")
+    repo.init()
+
+    assert repo.run(["config", "--local", "core.autocrlf"]).stdout.strip() == "false"
+
+    target = repo.path / "Languages" / "Русский.xml"
+    target.parent.mkdir(parents=True)
+    raw = "<?xml version=\"1.0\"?>\r\n<Язык/>\r\n".encode()
+    target.write_bytes(raw)
+    repo.commit_all("проверка", author="Тест <t@example.org>")
+
+    blob = repo.run(["cat-file", "-s", "HEAD:Languages/Русский.xml"]).stdout.strip()
+    assert int(blob) == len(raw)

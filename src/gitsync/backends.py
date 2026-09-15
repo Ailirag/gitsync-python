@@ -17,6 +17,7 @@ import logging
 import shutil
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Protocol
 
@@ -60,51 +61,89 @@ class NativeStorageBackend:
     def _create_file_infobase(self, worker_dir: Path) -> str:
         """Создаёт пустую файловую базу для потока.
 
-        НЕ ВЕРИФИЦИРОВАНО на живой платформе: используется документированный ключ
-        ``CREATEINFOBASE File="<путь>"``. Если база уже создана снаружи, передайте
-        готовую строку соединения через ``ib_factory``.
+        Строка соединения передаётся БЕЗ кавычек: ``CREATEINFOBASE File=<путь>``. Кавычки в
+        документации относятся к разбору командной строки оболочкой, а мы запускаем процесс
+        argv-массивом без shell. Проверено на 8.3.27.2130: ``File="<путь>"`` даёт код 1 и не
+        создаёт базу, ``File=<путь>`` — код 0 и настоящий файл базы.
+
+        Наличие базы проверяется по артефакту ``1Cv8.1CD`` — нулевой код возврата сам по себе
+        недостаточен. Если база создана снаружи, передайте строку соединения через ``ib_factory``.
         """
         base_dir = worker_dir / "ib"
         base_dir.mkdir(parents=True, exist_ok=True)
         self.runner.run(
-            [self.runner.v8_path, "CREATEINFOBASE", f'File="{base_dir}"', "/DisableStartupDialogs"]
+            [
+                self.runner.v8_path,
+                "CREATEINFOBASE",
+                f"File={base_dir}",
+                "/DisableStartupDialogs",
+                "/DisableStartupMessages",
+            ]
         )
+        if not (base_dir / "1Cv8.1CD").is_file():
+            raise GitSyncError(f"CREATEINFOBASE не создал файловую базу: {base_dir}")
         return f"/F{base_dir}"
 
     def _worker_context(self) -> tuple[Path, str]:
+        """Контекст потока: собственный каталог с уникальным именем и собственная ИБ.
+
+        Имя каталога — UUID, а не идентификатор потока: идентификаторы переиспользуются
+        после завершения потока, и два прогона могли бы попасть в один каталог.
+        """
         context = getattr(self._local, "context", None)
         if context is None:
-            worker_dir = self.temp_root / f"worker-{threading.get_ident()}"
-            worker_dir.mkdir(parents=True, exist_ok=True)
+            worker_dir = self.temp_root / f"worker-{uuid.uuid4().hex}"
+            worker_dir.mkdir(parents=True, exist_ok=False)
             context = (worker_dir, self.ib_factory(worker_dir))
             self._local.context = context
         return context
 
     def fetch_history(self, begin: int = 1) -> list[StorageVersion]:
         self.temp_root.mkdir(parents=True, exist_ok=True)
-        report_path = self.temp_root / "storage-report.txt"
         worker_dir, ib_connection = self._worker_context()
+        # Отчёт конфигуратора — табличный документ (MOXCEL) независимо от расширения файла.
+        report_path = worker_dir / f"storage-report-{uuid.uuid4().hex}.mxl"
         args = self.runner.build_report_args(
             self.access, report_path, begin=max(begin, 1), ib_connection=ib_connection
         )
         self.runner.run(args)
-        if not report_path.is_file():
+        if not report_path.is_file() or report_path.stat().st_size == 0:
             raise GitSyncError(f"Конфигуратор не создал отчёт по версиям: {report_path}")
-        # Конфигуратор пишет отчёт в UTF-8 (реже — в UTF-16 с BOM); читаем терпимо.
-        raw = report_path.read_bytes()
-        is_utf16 = raw[:2] in (b"\xff\xfe", b"\xfe\xff")
-        text = raw.decode("utf-16") if is_utf16 else raw.decode("utf-8", "replace")
-        return parse_storage_report(text)
+        return parse_storage_report(report_path.read_bytes())
 
     def export_version(self, version: int, dest: Path, cancel: threading.Event | None = None) -> None:
+        """Версия хранилища → каталог XML.
+
+        Три ОТДЕЛЬНЫХ запуска конфигуратора, как проверено на стенде:
+        ``/ConfigurationRepositoryDumpCfg -v N`` → ``/LoadCfg`` → ``/DumpConfigToFiles``.
+        Совмещение LoadCfg и DumpConfigToFiles в одном запуске давало код 0 без XML,
+        поэтому объединять их нельзя. Каждый шаг проверяется по артефакту.
+        """
         if cancel is not None and cancel.is_set():
             raise CancelledError("Отменено до начала выгрузки версии")
         worker_dir, ib_connection = self._worker_context()
         dest.mkdir(parents=True, exist_ok=True)
-        self.runner.run(self.runner.build_update_cfg_args(self.access, version, ib_connection))
+
+        cf_path = worker_dir / f"v{version}-{uuid.uuid4().hex}.cf"
+        self.runner.run(self.runner.build_dump_cfg_args(self.access, version, cf_path, ib_connection))
+        if not cf_path.is_file() or cf_path.stat().st_size == 0:
+            raise GitSyncError(f"Конфигуратор не выгрузил версию {version} из хранилища: {cf_path}")
+
         if cancel is not None and cancel.is_set():
             raise CancelledError("Отменено после получения версии из хранилища")
+
+        self.runner.run(
+            self.runner.build_load_cfg_args(cf_path, ib_connection, extension=self.extension)
+        )
+        if cancel is not None and cancel.is_set():
+            raise CancelledError("Отменено после загрузки версии во временную базу")
+
         self.runner.run(self.runner.build_dump_args(dest, ib_connection, extension=self.extension))
+        if not any(dest.iterdir()):
+            raise GitSyncError(
+                f"Конфигуратор не выгрузил версию {version} в файлы: каталог {dest} пуст"
+            )
+        cf_path.unlink(missing_ok=True)
 
 
 class FixtureStorageBackend:
@@ -112,21 +151,26 @@ class FixtureStorageBackend:
 
     Ожидаемая раскладка::
 
-        <root>/report.txt        # отчёт /ConfigurationRepositoryReport
+        <root>/report.mxl        # отчёт /ConfigurationRepositoryReport (MOXCEL)
         <root>/v1/...            # содержимое выгрузки версии 1
         <root>/v2/...
+
+    Имя ``report.txt`` тоже принимается: конфигуратор пишет MOXCEL независимо от расширения.
     """
 
     is_fixture = True
+    REPORT_NAMES = ("report.mxl", "report.txt")
 
     def __init__(self, root: str | Path):
         self.root = Path(root)
 
     def fetch_history(self, begin: int = 1) -> list[StorageVersion]:
-        report = self.root / "report.txt"
-        if not report.is_file():
-            raise GitSyncError(f"Не найден файл отчёта фикстуры: {report}")
-        versions = parse_storage_report(report.read_text(encoding="utf-8-sig"))
+        report = next((self.root / name for name in self.REPORT_NAMES if (self.root / name).is_file()), None)
+        if report is None:
+            raise GitSyncError(
+                f"Не найден файл отчёта фикстуры: {self.root / self.REPORT_NAMES[0]}"
+            )
+        versions = parse_storage_report(report.read_bytes())
         return [item for item in versions if item.number >= begin]
 
     def export_version(self, version: int, dest: Path, cancel: threading.Event | None = None) -> None:

@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from gitsync.designer import DesignerRunner, StorageAccess, mask_secrets
@@ -115,3 +117,42 @@ def test_run_never_uses_shell(tmp_path, monkeypatch):
 
     assert captured.get("shell", False) is False
     assert isinstance(captured["argv"], list)
+
+
+class _RecordingRunner:
+    """Заглушка запуска: пишет argv и делает вид, что конфигуратор отработал."""
+
+    def __init__(self, tmp_path):
+        self.v8_path = "1cv8.exe"
+        self.calls: list[list[str]] = []
+        self.tmp_path = tmp_path
+
+    def run(self, args, timeout=None):
+        self.calls.append(list(args))
+        if "CREATEINFOBASE" in args:
+            spec = next(item for item in args if item.startswith("File="))
+            Path(spec[len("File=") :].rstrip(";")).joinpath("1Cv8.1CD").write_bytes(b"ib")
+        return None
+
+
+def test_createinfobase_passes_path_without_quotes(tmp_path):
+    """Кавычки в строке соединения — артефакт shell.
+
+    Проверено на 8.3.27.2130: argv-форма ``File="<путь>"`` даёт код 1 и не создаёт базу,
+    ``File=<путь>`` — код 0 и настоящий 1Cv8.1CD. Запускаем мы без shell, поэтому кавычек быть
+    не должно.
+    """
+    from gitsync.backends import NativeStorageBackend
+    from gitsync.designer import StorageAccess
+
+    runner = _RecordingRunner(tmp_path)
+    backend = NativeStorageBackend(
+        access=StorageAccess(path=str(tmp_path / "repo"), user="acceptance"),
+        runner=runner,
+        temp_root=tmp_path / "temp",
+    )
+    connection = backend._create_file_infobase(tmp_path / "worker")
+
+    spec = next(item for item in runner.calls[0] if item.startswith("File="))
+    assert '"' not in spec, f"строка соединения содержит кавычки: {spec!r}"
+    assert connection.startswith("/F")

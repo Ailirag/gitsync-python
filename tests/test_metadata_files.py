@@ -19,6 +19,7 @@ from gitsync.authors import (
 )
 from gitsync.storage_report import StorageVersion, parse_storage_report
 from gitsync.version_file import read_version_file, write_version_file
+from support.native_report import ReportVersion, build_report_mxl
 
 
 def test_version_file_roundtrip_uses_upstream_xml_shape(tmp_path):
@@ -68,20 +69,17 @@ def test_primary_authors_file_matches_upstream_template():
 
 
 def test_parse_storage_report_extracts_versions_authors_dates_comments():
-    report = (
-        "﻿Отчет по версиям хранилища конфигурации\n"
-        "\n"
-        "Версия:                  1\n"
-        "Пользователь:            Иванов\n"
-        "Дата создания:           15.09.2026 10:20:30\n"
-        "Комментарий:             Первая версия\n"
-        "\n"
-        "Версия:                  2\n"
-        "Пользователь:            Петров\n"
-        "Дата создания:           16.09.2026 08:00:00\n"
-        "Комментарий:             Вторая версия\n"
-        "                         вторая строка комментария\n"
-        "\n"
+    report = build_report_mxl(
+        [
+            ReportVersion(1, "Иванов", "15.09.2026", "10:20:30", "Первая версия"),
+            ReportVersion(
+                2,
+                "Петров",
+                "16.09.2026",
+                "08:00:00",
+                "Вторая версия\nвторая строка комментария",
+            ),
+        ]
     )
 
     versions = parse_storage_report(report)
@@ -103,13 +101,18 @@ def test_parse_storage_report_extracts_versions_authors_dates_comments():
 
 
 def test_parse_storage_report_tolerates_thousand_separators_in_numbers():
-    report = (
-        "Версия:                  1 234\n"
-        "Пользователь: Иванов\n"
-        "Дата создания: 15.09.2026 10:20:30\n"
-        "Комментарий:\n"
-    )
+    report = build_report_mxl([ReportVersion(0, "Иванов", "15.09.2026", "10:20:30")])
+    # В табличном документе большие номера конфигуратор печатает с разделителем групп.
+    report = report.replace(b'"0"', b'"1 234"')
     assert parse_storage_report(report)[0].number == 1234
+
+
+def test_parse_storage_report_keeps_empty_comment_and_config_version():
+    report = build_report_mxl([ReportVersion(5, "Иванов", "15.09.2026", "10:20:30", comment="")])
+    version = parse_storage_report(report)[0]
+    assert version.number == 5
+    assert version.comment == ""
+    assert version.config_version == ""
 
 
 def test_parse_storage_report_rejects_empty_input():
