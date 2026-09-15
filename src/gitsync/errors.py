@@ -33,3 +33,19 @@ class UnsafePathError(GitSyncError):
 
 class CancelledError(GitSyncError):
     """Выполнение отменено пользователем."""
+
+
+class ExportIncompleteError(GitSyncError):
+    """Бэкенд не подтвердил выгрузку версии: каталога нет или он пуст без явного разрешения."""
+
+
+class VersionFileError(GitSyncError):
+    """Файл VERSION отсутствует или не читается — продолжать нельзя (см. init/set-version)."""
+
+
+class PostCommitError(GitSyncError):
+    """Коммит уже создан, но обработчик после коммита завершился с ошибкой."""
+
+
+class ConfigError(GitSyncError):
+    """Ошибка в файле конфигурации пакетного режима."""

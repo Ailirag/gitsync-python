@@ -14,12 +14,14 @@ import os
 import signal
 import sys
 import threading
+import uuid
 from pathlib import Path
 
 from . import __version__
 from .backends import FixtureStorageBackend, NativeStorageBackend
 from .designer import DEFAULT_DESIGNER_TIMEOUT, DesignerRunner, StorageAccess
-from .errors import GitSyncError
+from .errors import ConfigError, GitSyncError
+from .locks import exclusive_lock
 from .plugins import PluginHost
 from .sync import SyncManager, SyncOptions
 
@@ -59,7 +61,10 @@ def _build_backend(args) -> object:
         password_env=args.storage_password_env,
         password_file=args.storage_password_file,
     )
+    # Собственный каталог запуска: общий родитель могут использовать другие репозитории
+    # и параллельные запуски, а рабочие каталоги конфигуратора нельзя делить.
     temp_root = Path(args.temp_root or (Path(args.workdir).parent / ".gitsync-tmp"))
+    temp_root = temp_root / f"native-{uuid.uuid4().hex}"
     runner = DesignerRunner(
         v8_path=args.v8_path,
         out_dir=temp_root / "designer-out",
@@ -82,6 +87,7 @@ def _options_from_args(args) -> SyncOptions:
         lock_timeout=args.lock_timeout,
         limit=args.limit,
         allow_dirty=args.allow_dirty,
+        disable_auto_src=getattr(args, "disable_auto_src", False),
     )
 
 
@@ -142,20 +148,109 @@ def _cmd_clone(args) -> int:
 
 
 def _cmd_set_version(args) -> int:
-    from .version_file import write_version_file
+    import datetime as dt
 
-    write_version_file(args.workdir, args.version)
-    print(f"Версия {args.version} записана в {Path(args.workdir) / 'VERSION'}")
+    from .gitrepo import GitRepo
+    from .sync import discover_repo_root, resolve_lock_path
+    from .version_file import version_file_path, write_version_file
+
+    work_dir = Path(args.workdir)
+    root = discover_repo_root(work_dir)
+    target = work_dir
+    if not args.disable_auto_src and not version_file_path(work_dir).is_file() \
+            and version_file_path(work_dir / "src").is_file():
+        target = work_dir / "src"
+    # Маркер версии — то же общее состояние, что и у sync: писать его мимо блокировки значит
+    # менять точку продолжения под работающим writer'ом.
+    with exclusive_lock(resolve_lock_path(work_dir), timeout=args.lock_timeout):
+        path = write_version_file(target, args.version)
+        print(f"Версия {args.version} записана в {path}")
+        if args.commit:
+            repo = GitRepo(root)
+            if not repo.is_repository():
+                raise GitSyncError(f"Каталог <{root}> не является репозиторием git")
+            repo.run(["add", "--", str(path)])
+            sha = repo.commit_all(
+                message=f"Установлена версия хранилища {args.version}",
+                author=args.commit_author,
+                date=dt.datetime.now(),
+            )
+            print(f"Зафиксировано: {sha}" if sha else "Изменений нет, коммит не потребовался")
     return 0
 
 
-def _cmd_sync_all(args) -> int:
-    config = json.loads(Path(args.config).read_text(encoding="utf-8"))
+#: Ключи, которые понимает пакетный режим. Неизвестная схема (например, upstream
+#: ``repositories``) отвергается явно: молча выполнить ноль хранилищ и вернуть 0 нельзя.
+_BATCH_TOP_KEYS = frozenset({"storages", "defaults"})
+_BATCH_ENTRY_KEYS = frozenset({
+    "name", "disable", "disabled", "workdir", "backend", "fixture_root", "storage_path",
+    "storage_user", "storage_password_env", "storage_password_file", "v8_path", "v8_version",
+    "extension", "designer_timeout", "jobs", "queue_limit", "retries", "temp_root",
+    "email_domain", "keep_temp", "lock_timeout", "limit", "allow_dirty", "disable_auto_src",
+    "plugins",
+})
+
+
+def _validate_batch_config(config: object) -> list[dict]:
+    """Проверяет схему ДО любых работ и возвращает список записей."""
+    if not isinstance(config, dict):
+        raise ConfigError("Файл конфигурации должен содержать объект JSON с ключом <storages>")
+    unknown = sorted(set(config) - _BATCH_TOP_KEYS)
+    if unknown:
+        raise ConfigError(
+            f"Неизвестные ключи конфигурации: {', '.join(unknown)}. "
+            f"Поддерживаются: {', '.join(sorted(_BATCH_TOP_KEYS))}. "
+            "Формат конфигурации upstream (ключ <repositories>) не поддерживается — "
+            "перечислите хранилища в <storages>."
+        )
+    if "storages" not in config:
+        raise ConfigError("В конфигурации нет ключа <storages>")
+    storages = config["storages"]
+    if not isinstance(storages, list) or not storages:
+        raise ConfigError("Ключ <storages> должен быть непустым списком хранилищ")
     defaults = config.get("defaults", {})
-    failures: list[str] = []
-    for entry in config.get("storages", []):
+    if not isinstance(defaults, dict):
+        raise ConfigError("Ключ <defaults> должен быть объектом")
+    entries: list[dict] = []
+    names: set[str] = set()
+    for position, entry in enumerate(storages, 1):
+        if not isinstance(entry, dict):
+            raise ConfigError(f"Хранилище №{position}: ожидался объект JSON")
         merged = {**defaults, **entry}
-        name = merged.get("name") or merged.get("workdir")
+        unknown = sorted(set(merged) - _BATCH_ENTRY_KEYS)
+        if unknown:
+            raise ConfigError(f"Хранилище №{position}: неизвестные ключи {', '.join(unknown)}")
+        if not merged.get("workdir"):
+            raise ConfigError(f"Хранилище №{position}: не задан workdir")
+        name = str(merged.get("name") or merged["workdir"])
+        if name in names:
+            raise ConfigError(f"Имя хранилища <{name}> повторяется")
+        names.add(name)
+        merged["name"] = name
+        entries.append(merged)
+    return entries
+
+
+def _cmd_sync_all(args) -> int:
+    try:
+        config = json.loads(Path(args.config).read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise ConfigError(f"Файл <{args.config}> не является корректным JSON: {exc}") from exc
+    entries = _validate_batch_config(config)
+    if args.name:
+        selected = [entry for entry in entries if entry["name"] in set(args.name)]
+        missing = sorted(set(args.name) - {entry["name"] for entry in entries})
+        if missing:
+            raise ConfigError(f"В конфигурации нет хранилищ: {', '.join(missing)}")
+        entries = selected
+    failures: list[str] = []
+    executed = 0
+    for merged in entries:
+        name = merged["name"]
+        if merged.get("disable") or merged.get("disabled"):
+            print(f"=== {name}: отключено в конфигурации, пропускаю ===")
+            continue
+        executed += 1
         print(f"=== {name} ===")
         sub = argparse.Namespace(
             workdir=merged["workdir"],
@@ -178,6 +273,7 @@ def _cmd_sync_all(args) -> int:
             lock_timeout=merged.get("lock_timeout", 30.0),
             limit=merged.get("limit"),
             allow_dirty=merged.get("allow_dirty", False),
+            disable_auto_src=merged.get("disable_auto_src", False),
             plugin=merged.get("plugins", []),
         )
         try:
@@ -191,6 +287,8 @@ def _cmd_sync_all(args) -> int:
     if failures:
         print(f"Неуспешные хранилища: {', '.join(failures)}", file=sys.stderr)
         return 1
+    if not executed:
+        print("Не выполнено ни одного хранилища: все записи отключены или отфильтрованы")
     return 0
 
 
@@ -229,6 +327,8 @@ def _add_common(parser: argparse.ArgumentParser, with_storage: bool = True) -> N
     parser.add_argument("--limit", type=int, help="обработать не более N версий за запуск")
     parser.add_argument("--allow-dirty", action="store_true",
                         help="разрешить работу с грязной рабочей копией (по умолчанию запрещено)")
+    parser.add_argument("--disable-auto-src", action="store_true",
+                        help="не искать подкаталог src: работать строго в --workdir")
     parser.add_argument("--plugin", action="append", help="python-модуль плагина (можно повторять)")
     parser.add_argument("--log-level", default="INFO", help="уровень лога: DEBUG/INFO/WARNING/ERROR")
 
@@ -259,11 +359,20 @@ def build_parser() -> argparse.ArgumentParser:
     setver = sub.add_parser("set-version", help="записать номер синхронизированной версии в VERSION")
     setver.add_argument("--workdir", required=True, help="каталог рабочей копии git")
     setver.add_argument("--version", dest="version", type=int, required=True, help="номер версии")
+    setver.add_argument("--commit", action="store_true", help="сразу зафиксировать VERSION в git")
+    setver.add_argument("--commit-author", default="gitsync <gitsync@localhost>",
+                        help="автор коммита для --commit")
+    setver.add_argument("--disable-auto-src", action="store_true",
+                        help="не искать подкаталог src: работать строго в --workdir")
+    setver.add_argument("--lock-timeout", type=float, default=5.0,
+                        help="ожидание блокировки цели, с (команда оператора — ждём недолго)")
     setver.add_argument("--log-level", default="INFO", help="уровень лога")
     setver.set_defaults(func=_cmd_set_version)
 
     batch = sub.add_parser("sync-all", help="пакетная синхронизация нескольких хранилищ из JSON-файла")
     batch.add_argument("--config", required=True, help="файл конфигурации со списком хранилищ")
+    batch.add_argument("--name", action="append",
+                       help="выполнить только указанное хранилище (можно повторять)")
     batch.add_argument("--log-level", default="INFO", help="уровень лога")
     batch.set_defaults(func=_cmd_sync_all)
 

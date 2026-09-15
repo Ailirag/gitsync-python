@@ -57,6 +57,10 @@ class NativeStorageBackend:
         # ib_factory(worker_dir) -> строка соединения с ИБ; по умолчанию файловая база.
         self.ib_factory = ib_factory or self._create_file_infobase
         self._local = threading.local()
+        self._worker_dirs: list[Path] = []
+        if access.password:
+            # Конфигуратор повторяет свои аргументы в сообщениях — вымарываем значение всюду.
+            self.runner.secrets.append(access.password)
 
     def _create_file_infobase(self, worker_dir: Path) -> str:
         """Создаёт пустую файловую базу для потока.
@@ -96,7 +100,14 @@ class NativeStorageBackend:
             worker_dir.mkdir(parents=True, exist_ok=False)
             context = (worker_dir, self.ib_factory(worker_dir))
             self._local.context = context
+            self._worker_dirs.append(worker_dir)
         return context
+
+    def cleanup(self) -> None:
+        """Удаляет ТОЛЬКО собственные рабочие каталоги (созданные этим экземпляром)."""
+        while self._worker_dirs:
+            shutil.rmtree(self._worker_dirs.pop(), ignore_errors=True)
+        self._local = threading.local()
 
     def fetch_history(self, begin: int = 1) -> list[StorageVersion]:
         self.temp_root.mkdir(parents=True, exist_ok=True)

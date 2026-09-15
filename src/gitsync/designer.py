@@ -70,6 +70,39 @@ def mask_secrets(args: list[str]) -> list[str]:
     return masked
 
 
+def secret_values(args: list[str]) -> list[str]:
+    """Значения, которые нельзя показывать: то, что стоит за ключами пароля."""
+    values: list[str] = []
+    take_next = False
+    for item in args:
+        if take_next:
+            if item:
+                values.append(item)
+            take_next = False
+            continue
+        matched = next((p for p in _SECRET_PREFIXES if item == p or item.startswith(p)), None)
+        if matched is None:
+            continue
+        if item == matched:
+            take_next = True
+        elif item[len(matched):]:
+            values.append(item[len(matched):])
+    return values
+
+
+def redact_text(text: str, secrets: list[str]) -> str:
+    """Убирает известные секреты из ЛЮБОГО внешнего текста (stdout/stderr конфигуратора).
+
+    Маскировки argv недостаточно: дочерний процесс может напечатать переданное ему значение,
+    а его вывод попадает и в текст исключения, и в лог.
+    """
+    if not text:
+        return text
+    for secret in sorted({item for item in secrets if item}, key=len, reverse=True):
+        text = text.replace(secret, MASK)
+    return text
+
+
 class DesignerRunner:
     """Сборка argv и запуск конфигуратора."""
 
@@ -87,6 +120,8 @@ class DesignerRunner:
         self.timeout = timeout
         # Апстрим форсирует RU: выгрузка истории хранилища с другими языками даёт только RU-отчёт.
         self.language = language
+        #: Дополнительные значения для вымарывания из вывода дочернего процесса.
+        self.secrets: list[str] = []
 
     # --- сборка аргументов ---------------------------------------------
 
@@ -206,6 +241,9 @@ class DesignerRunner:
 
     def run(self, args: list[str], timeout: float | None = None) -> subprocess.CompletedProcess[str]:
         safe = mask_secrets(args)
+        # Секреты берём и из argv, и из явно зарегистрированных значений: конфигуратор
+        # повторяет свои аргументы в сообщениях, а вывод уходит в исключение и лог.
+        secrets = secret_values(args) + list(self.secrets)
         log.debug("Запуск конфигуратора: %s", " ".join(safe))
         try:
             result = subprocess.run(
@@ -218,13 +256,15 @@ class DesignerRunner:
                 shell=False,
                 check=False,
             )
-        except subprocess.TimeoutExpired as exc:
+        except subprocess.TimeoutExpired:
             raise DesignerTimeoutError(
                 f"Конфигуратор не завершился за {timeout or self.timeout:g} с: {' '.join(safe)}"
-            ) from exc
+            ) from None  # цепочка исключений вернула бы незамаскированный argv/вывод
         if result.returncode != 0:
             raise DesignerError(
                 f"Конфигуратор завершился с кодом {result.returncode}: {' '.join(safe)}\n"
-                f"{(result.stderr or result.stdout or '').strip()[:2000]}"
+                + redact_text((result.stderr or result.stdout or "").strip()[:2000], secrets)
             )
+        result.stdout = redact_text(result.stdout or "", secrets)
+        result.stderr = redact_text(result.stderr or "", secrets)
         return result
