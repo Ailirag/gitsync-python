@@ -224,7 +224,13 @@ def test_f05_rollback_keeps_external_untracked_file(tmp_path):
     _seed(work, 0, {"object.txt": "старый"})
     outsider = work / "чужой.txt"
     outsider.write_text("чужие данные", encoding="utf-8")
+    outsider_bytes = outsider.read_bytes()
     manager = _manager(work, _backend(1), allow_dirty=True)
+    before_head = manager.repo.head_sha()
+    before_index = manager.repo.run(["ls-files", "--stage", "-z"]).stdout
+    tracked = manager.repo.run(["ls-files", "-z"]).stdout.split("\0")
+    before_files = {name: (work / name).read_bytes() for name in tracked if name}
+    before_status = manager.repo.run(["status", "--porcelain", "-z"]).stdout
 
     def fail(**kwargs):
         raise RuntimeError("сбой git commit (инъекция теста)")
@@ -232,10 +238,13 @@ def test_f05_rollback_keeps_external_untracked_file(tmp_path):
     manager.repo.commit_all = fail
     manager.sync(raise_on_error=False)
 
-    # Очистка рабочей копии — часть контракта upstream, но откат не должен добивать
-    # то, что мы не писали: файл существовал до нас и восстановлению не подлежит,
-    # поэтому проверяем главное — откат не удаляет чужие файлы, созданные ПОСЛЕ очистки.
-    assert not manager.repo.run(["status", "--porcelain"]).stdout.strip()
+    # Review-02 R01: a clean status would require deleting the pre-existing outsider.
+    # Compare actual bytes and full tracked/index prestate, not absence of user data.
+    assert outsider.read_bytes() == outsider_bytes
+    assert manager.repo.head_sha() == before_head
+    assert manager.repo.run(["ls-files", "--stage", "-z"]).stdout == before_index
+    assert {name: (work / name).read_bytes() for name in before_files} == before_files
+    assert manager.repo.run(["status", "--porcelain", "-z"]).stdout == before_status
 
 
 # --- F06: ошибка после коммита не откатывает маркер -----------------------

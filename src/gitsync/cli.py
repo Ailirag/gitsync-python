@@ -21,7 +21,6 @@ from . import __version__
 from .backends import FixtureStorageBackend, NativeStorageBackend
 from .designer import DEFAULT_DESIGNER_TIMEOUT, DesignerRunner, StorageAccess
 from .errors import ConfigError, GitSyncError
-from .locks import exclusive_lock
 from .plugins import PluginHost
 from .sync import SyncManager, SyncOptions
 
@@ -118,7 +117,7 @@ def _make_manager(args) -> SyncManager:
 
 def _cmd_init(args) -> int:
     manager = _make_manager(args)
-    manager.init_working_copy(generate_authors=not args.no_authors)
+    manager.init_working_copy(generate_authors=not args.no_authors, raise_on_error=True)
     print(f"Рабочая копия подготовлена: {args.workdir}")
     return 0
 
@@ -143,39 +142,16 @@ def _cmd_sync(args) -> int:
 
 def _cmd_clone(args) -> int:
     manager = _make_manager(args)
-    manager.init_working_copy(generate_authors=not args.no_authors)
+    manager.init_working_copy(generate_authors=not args.no_authors, raise_on_error=True)
     return _cmd_sync(args)
 
 
 def _cmd_set_version(args) -> int:
-    import datetime as dt
-
-    from .gitrepo import GitRepo
-    from .sync import discover_repo_root, resolve_lock_path
-    from .version_file import version_file_path, write_version_file
-
-    work_dir = Path(args.workdir)
-    root = discover_repo_root(work_dir)
-    target = work_dir
-    if not args.disable_auto_src and not version_file_path(work_dir).is_file() \
-            and version_file_path(work_dir / "src").is_file():
-        target = work_dir / "src"
-    # Маркер версии — то же общее состояние, что и у sync: писать его мимо блокировки значит
-    # менять точку продолжения под работающим writer'ом.
-    with exclusive_lock(resolve_lock_path(work_dir), timeout=args.lock_timeout):
-        path = write_version_file(target, args.version)
-        print(f"Версия {args.version} записана в {path}")
-        if args.commit:
-            repo = GitRepo(root)
-            if not repo.is_repository():
-                raise GitSyncError(f"Каталог <{root}> не является репозиторием git")
-            repo.run(["add", "--", str(path)])
-            sha = repo.commit_all(
-                message=f"Установлена версия хранилища {args.version}",
-                author=args.commit_author,
-                date=dt.datetime.now(),
-            )
-            print(f"Зафиксировано: {sha}" if sha else "Изменений нет, коммит не потребовался")
+    manager = SyncManager(args.workdir, None, SyncOptions(
+        disable_auto_src=args.disable_auto_src, lock_timeout=args.lock_timeout))
+    manager.set_version(args.version, commit=args.commit, author=args.commit_author,
+                        raise_on_error=True)
+    print(f"Версия {args.version} записана")
     return 0
 
 

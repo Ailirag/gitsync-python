@@ -130,8 +130,16 @@ class GitRepo:
         author: str,
         date: dt.datetime | None = None,
         committer: str | None = None,
+        *,
+        records: dict | None = None,
+        expected_head: str | None = None,
+        prepared=None,
+        lock_token: str | None = None,
     ) -> str | None:
-        """``git add -A .`` + commit. Возвращает SHA или None, если коммитить нечего."""
+        """Legacy explicit all-files commit, or a content-bound isolated transaction."""
+        if records is not None:
+            return self._commit_scoped(message, author, date, committer, records,
+                                       expected_head, prepared, lock_token)
         self.run(["add", "-A", "."])
         if self.is_clean():
             log.debug("Нет изменений — коммит пропущен")
@@ -171,6 +179,51 @@ class GitRepo:
                 f"{(result.stderr or result.stdout).strip()}"
             )
         return self.head_sha()
+
+    def _commit_scoped(self, message, author, date, committer, records, head, prepared, lock_token):
+        import tempfile
+
+        from .transaction import image, index_entries, locked_index, owned_path, update_entries
+
+        self.last_commit_ack = None
+        stamp = format_git_date(date or dt.datetime.now())
+        an, ae = split_signature(author)
+        cn, ce = split_signature(committer or author)
+        identity = {'GIT_AUTHOR_NAME': an, 'GIT_AUTHOR_EMAIL': ae, 'GIT_AUTHOR_DATE': stamp,
+                    'GIT_COMMITTER_NAME': cn, 'GIT_COMMITTER_EMAIL': ce, 'GIT_COMMITTER_DATE': stamp}
+        with locked_index(self, lock_token) as user_env:
+            if self.head_sha() != head:
+                raise GitSyncError('HEAD changed before publication')
+            current = index_entries(self, user_env)
+            for name, record in records.items():
+                if current.get(name) != record['index_before']:
+                    raise GitSyncError(f'External staged edit: {name}')
+                if image(owned_path(self.path, name)) != record['after']:
+                    raise GitSyncError(f'External worktree edit: {name}')
+            # Tree starts from HEAD, not from the user's staged changes.
+            gitdir = Path(user_env['GIT_INDEX_FILE']).parent
+            fd, name = tempfile.mkstemp(prefix='gitsync-tree-', dir=gitdir)
+            os.close(fd)
+            isolated = Path(name)
+            isolated.unlink()
+            try:
+                env = {**identity, 'GIT_INDEX_FILE': str(isolated)}
+                self.run(['read-tree', head] if head else ['read-tree', '--empty'], env=env)
+                updates = {n: r['index_after'] for n, r in records.items()}
+                update_entries(self, updates, env)
+                tree = self.run(['write-tree'], env=env).stdout.strip()
+                args = ['commit-tree', tree, *(['-p', head] if head else []),
+                        '-m', message if message and message.strip() else '.']
+                sha = self.run(args, env=env).stdout.strip()
+                if prepared:
+                    prepared(sha)  # WAL knows exact commit identity before ref publication
+                # Stage only our paths in a private copy of the current user index.
+                update_entries(self, updates, user_env)
+                self.run(['update-ref', 'HEAD', sha, head or '0' * 40])
+                self.last_commit_ack = sha  # durable Git acknowledgement, before bookkeeping
+                return sha
+            finally:
+                isolated.unlink(missing_ok=True)
 
     def last_commit_message(self) -> str:
         return self.run(["log", "-1", "--format=%B"], check=False).stdout.strip()

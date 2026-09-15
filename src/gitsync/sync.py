@@ -43,6 +43,7 @@ from .locks import exclusive_lock
 from .plugins import PluginHost
 from .safepath import safe_join
 from .storage_report import StorageVersion
+from .transaction import blob_entry, image, index_entries, locked_index, owned_path, put_image, update_entries
 from .version_file import (
     AUTHORS_FILE_NAME,
     VERSION_FILE_NAME,
@@ -63,7 +64,7 @@ SERVICE_NAMES = frozenset(
 #: ``.git`` — управляющий каталог Git: подмена ``config``/``hooks`` меняет поведение Git.
 #: ``git~1`` — короткое имя NTFS для ``.git``; Windows отбрасывает хвостовые точки и пробелы,
 #: поэтому сравнение идёт по нормализованному имени без регистра.
-RESERVED_INPUT_NAMES = frozenset({".git", "git~1", ".gitsync-py.lock"})
+RESERVED_INPUT_NAMES = frozenset({".git", "git~1", ".gitsync-py.lock", "authors", "version", ".hooks"})
 
 #: Имя файла журнала транзакции внутри каталога ``.git``.
 JOURNAL_FILE_NAME = "gitsync-py-journal.json"
@@ -156,11 +157,8 @@ def move_export_into_working_copy(work_dir: Path, export_dir: Path) -> list[Path
         if source.is_dir() and not source.is_symlink():
             target.mkdir(parents=True, exist_ok=True)
             continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.is_symlink():
-            # Иначе copyfile пишет ПО ссылке — наружу рабочей копии.
-            target.unlink()
-        shutil.copyfile(source, target)
+        target = owned_path(work_dir, relative.as_posix())
+        put_image(target, image(source))
         written.append(target)
     return written
 
@@ -174,18 +172,15 @@ class _Journal:
     def read(self) -> dict | None:
         try:
             return json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except FileNotFoundError:
             return None
 
     def write(self, payload: dict) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        # Журнал должен пережить отключение процесса, иначе откат нечем обосновать.
-        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(json.dumps(payload, ensure_ascii=False))
-            handle.flush()
-            os.fsync(handle.fileno())
-        tmp.replace(self.path)
+        import base64
+
+        path = owned_path(self.path.parent, self.path.name)
+        put_image(path, {"data": base64.b64encode(json.dumps(payload, ensure_ascii=False).encode()).decode(),
+                         "mode": 0o600})
 
     def clear(self) -> None:
         self.path.unlink(missing_ok=True)
@@ -211,9 +206,11 @@ class SyncManager:
         """Каталог выгрузки: сам workdir или подкаталог ``src`` (раскладка upstream)."""
         if self.options.disable_auto_src:
             return self.work_dir
+        candidate = self.work_dir / "src"
+        if version_file_path(self.work_dir).is_file() and version_file_path(candidate).is_file():
+            raise UnsafePathError('Ambiguous root and src markers; select explicit target')
         if version_file_path(self.work_dir).is_file():
             return self.work_dir
-        candidate = self.work_dir / "src"
         if version_file_path(candidate).is_file():
             log.info("Обнаружена раскладка с подкаталогом src: работаю в %s", candidate)
             return candidate
@@ -285,55 +282,109 @@ class SyncManager:
 
     # --- транзакция --------------------------------------------------------
 
-    def _tracked_files(self) -> set[str]:
-        rel = self._rel_to_repo(self.sync_dir)
-        args = ["ls-files", "--"] + ([rel] if rel != "." else ["."])
-        result = self.repo.run(args, check=False)
-        return {line.strip().strip('"') for line in result.stdout.splitlines() if line.strip()}
+    def _validate_transaction(self, entry: dict) -> None:
+        if (not isinstance(entry, dict) or entry.get("schema") != 2
+                or entry.get("repo") != str(self.repo.path.resolve())
+                or entry.get("sync_dir") != str(self.sync_dir.resolve())
+                or entry.get("state") not in {"committing", "committed"}
+                or not isinstance(entry.get("version"), int)
+                or not isinstance(entry.get("files"), dict)
+                or not isinstance(entry.get("lock_token"), str)
+                or len(entry["lock_token"]) != 32
+                or any(c not in "0123456789abcdef" for c in entry["lock_token"])):
+            raise UnsafePathError("Invalid or legacy journal; retained for manual recovery")
+        prefix = self._rel_to_repo(self.sync_dir)
+        directories = entry.get('created_dirs', [])
+        if not isinstance(directories, list):
+            raise UnsafePathError('Invalid created directories')
+        for name in directories:
+            owned_path(self.repo.path, name)
+            if (name == prefix or (prefix != '.' and not name.startswith(prefix + '/'))
+                    or not any(p.startswith(name + '/') and r.get('before') is None
+                               and r.get('after') is not None
+                               for p, r in entry['files'].items() if isinstance(r, dict))):
+                raise UnsafePathError('Unowned created directory')
+        for name, record in entry["files"].items():
+            owned_path(self.repo.path, name)
+            if prefix != "." and not name.startswith(prefix + "/"):
+                raise UnsafePathError("Journal target outside selected subtree")
+            if (not isinstance(record, dict)
+                    or set(record) != {"before", "after", "index_before", "index_after"}):
+                raise UnsafePathError("Invalid transaction record")
+            for key in ("before", "after"):
+                value = record[key]
+                if value is not None:
+                    import base64
+                    if not isinstance(value, dict) or set(value) != {"data", "mode"}:
+                        raise UnsafePathError("Invalid preimage")
+                    base64.b64decode(value["data"], validate=True)
+                    if not isinstance(value["mode"], int) or not 0 <= value["mode"] <= 0o777:
+                        raise UnsafePathError("Invalid file mode")
+            for key in ("index_before", "index_after"):
+                value = record[key]
+                if value is not None:
+                    import re
+                    if (not isinstance(value, str)
+                            or not re.fullmatch(r"100(?:644|755) [0-9a-f]{40,64} 0", value)):
+                        raise UnsafePathError("Invalid index preimage")
 
-    def _rollback_to_confirmed(self, written: list[str]) -> None:
-        """Возвращает СВОИ записи к последнему подтверждённому коммиту.
+    def _rollback_to_confirmed(self, entry: dict) -> None:
+        """Restore recorded preimages only if every affected path is still ours.
 
-        Чужие файлы не трогаются: удаляются только пути из журнала, которых нет в индексе.
+        A conflicting editor/index/HEAD stops recovery, retaining the entire journal.
+        The mutable index is never treated as a committed baseline.
         """
-        has_head = self.repo.head_sha() is not None
-        tracked = self._tracked_files() if has_head else set()
-        for entry in written:
-            if entry in tracked:
-                continue
-            candidate = self.repo.path / entry
-            if candidate.is_file() or candidate.is_symlink():
-                candidate.unlink(missing_ok=True)
-        if has_head:
-            rel = self._rel_to_repo(self.sync_dir)
-            target = "." if rel == "." else rel
-            # Снимаем возможную индексацию и возвращаем содержимое своей подпапки из HEAD.
-            self.repo.run(["reset", "--quiet", "--", target], check=False)
-            self.repo.run(["checkout", "--force", "HEAD", "--", target], check=False)
+        self._validate_transaction(entry)
+        if self.repo.head_sha() != entry.get("head"):
+            raise UnsafePathError("HEAD changed; refusing rollback, journal retained")
+        with locked_index(self.repo, entry["lock_token"]) as env:
+            current_index = index_entries(self.repo, env)
+            for name, record in entry["files"].items():
+                current = image(owned_path(self.repo.path, name))
+                if current not in (record["before"], record["after"]):
+                    raise UnsafePathError(f"External file edit: {name}; journal retained")
+                if current_index.get(name) not in (record["index_before"], record["index_after"]):
+                    raise UnsafePathError(f"External index edit: {name}; journal retained")
+            for name, record in entry["files"].items():
+                path = owned_path(self.repo.path, name)
+                if image(path) != record["before"]:
+                    put_image(path, record["before"])
+            update_entries(self.repo, {n: r["index_before"] for n, r in entry["files"].items()}, env)
+        self._prune_empty_dirs(entry.get('created_dirs', []))
+
+    def _prune_empty_dirs(self, names: list[str]) -> None:
+        """Only recorded candidates, deepest first; rmdir never deletes user contents."""
+        for name in sorted(set(names), key=lambda n: len(Path(n).parts), reverse=True):
+            folder = owned_path(self.repo.path, name)
+            try:
+                folder.rmdir()
+            except OSError:
+                pass  # absent or nonempty: never recurse into a concurrent editor's files
 
     def _reconcile_journal(self, result: SyncResult) -> None:
-        """Сверяет журнал с подтверждённым коммитом и снимает незавершённую транзакцию."""
         journal = self._journal()
         entry = journal.read()
-        if not entry:
+        if entry is None:
             return
-        version = entry.get("version")
-        confirmed = self._committed_marker()
-        marker_path = version_file_path(self.sync_dir)
-        marker = read_version_file(self.sync_dir) if marker_path.is_file() else None
-        if entry.get("state") == "committed":
+        self._validate_transaction(entry)
+        lock = self._git_dir() / 'index.lock'
+        if lock.exists():
+            if lock.is_symlink() or lock.read_bytes() != ('gitsync:' + entry['lock_token']).encode():
+                raise UnsafePathError('Unowned index.lock; journal retained')
+            lock.unlink()  # canonical lifecycle lock proves the previous GitSync owner exited
+        if entry.get("sha") and self.repo.head_sha() == entry["sha"]:
+            with locked_index(self.repo, entry['lock_token']) as env:
+                current = index_entries(self.repo, env)
+                updates = {}
+                for name, record in entry['files'].items():
+                    if current.get(name) not in (record['index_before'], record['index_after']):
+                        raise UnsafePathError('External index edit after commit; journal retained')
+                    updates[name] = record['index_after']
+                update_entries(self.repo, updates, env)
             journal.clear()
             return
-        if marker == version and (confirmed is None or confirmed < version):
-            log.warning(
-                "Найдена незавершённая транзакция версии %s (в Git подтверждена %s) — "
-                "откатываю свои записи и повторяю версию", version, confirmed
-            )
-            self._rollback_to_confirmed(list(entry.get("written", [])))
-            if confirmed is None:
-                write_version_file(self.sync_dir, entry.get("previous", 0))
-            if isinstance(version, int):
-                result.rolled_back.append(version)
+        self._rollback_to_confirmed(entry)
+        result.rolled_back.append(entry["version"])
         journal.clear()
 
     # --- вспомогательное -------------------------------------------------
@@ -407,25 +458,91 @@ class SyncManager:
             "бэкенд должен объявить allows_empty_export = True."
         )
 
+    def _target_state(self) -> tuple:
+        """Content baseline captured before exporters run; advisory locks do not lock editors."""
+        files = {}
+        for path in self.sync_dir.rglob('*'):
+            rel = path.relative_to(self.sync_dir)
+            if rel.parts[0] in {'.git', '.hooks'}:
+                continue
+            if path.is_file() or path.is_symlink():
+                name = path.absolute().relative_to(self.repo.path.absolute()).as_posix()
+                files[name] = image(owned_path(self.repo.path, name))
+        prefix = self._rel_to_repo(self.sync_dir)
+        staged = {n: v for n, v in index_entries(self.repo).items()
+                  if prefix == '.' or n.startswith(prefix + '/')}
+        return self.repo.head_sha(), files, staged
+
     def _commit_version(self, version: StorageVersion, export_dir: Path, authors: dict[str, str],
                         previous: int) -> str | None:
+        import base64
+
+        if self._target_state() != self._baseline:
+            raise UnsafePathError('Target changed during export; no files written')
         journal = self._journal()
-        journal.write({"version": version.number, "state": "committing", "previous": previous,
-                       "sync_dir": str(self.sync_dir), "written": []})
-        clean_working_copy(self.sync_dir)
-        written = move_export_into_working_copy(self.sync_dir, export_dir)
-        marker = write_version_file(self.sync_dir, version.number)
-        journal.write({
-            "version": version.number,
-            "state": "committing",
-            "previous": previous,
-            "sync_dir": str(self.sync_dir),
-            "written": [self._rel_to_repo(item) for item in [*written, marker]],
-        })
+        before_index = index_entries(self.repo)
+        files = {}
+        for path in self.sync_dir.rglob("*"):
+            relative = path.relative_to(self.sync_dir)
+            if relative.parts[0] in SERVICE_NAMES:
+                continue
+            if path.is_file() or path.is_symlink():
+                name = self._rel_to_repo(path)
+                files[name] = {"before": image(owned_path(self.repo.path, name)), "after": None}
+        for source in export_dir.rglob("*"):
+            if not source.is_file():
+                continue
+            relative = source.relative_to(export_dir)
+            check_reserved_paths(relative)
+            name = (Path(self._rel_to_repo(self.sync_dir)) / relative).as_posix()
+            target = owned_path(self.repo.path, name)
+            files[name] = {"before": image(target), "after": image(source)}
+        marker_name = self._rel_to_repo(version_file_path(self.sync_dir))
+        body = '<?xml version="1.0" encoding="UTF-8"?>\n' f'<VERSION>{version.number}</VERSION>\n'
+        files[marker_name] = {"before": image(owned_path(self.repo.path, marker_name)),
+                              "after": {"data": base64.b64encode(body.encode()).decode(),
+                                        "mode": 0o666 if os.name == "nt" else 0o644}}
+        for name, record in files.items():
+            record["index_before"] = before_index.get(name)
+            record["index_after"] = blob_entry(self.repo, record["after"])
+        created_dirs, removed_dirs = set(), set()
+        for name, record in files.items():
+            parent = owned_path(self.repo.path, name).parent
+            while parent.absolute() != self.sync_dir.absolute():
+                relative = self._rel_to_repo(parent)
+                if record['after'] is not None and not parent.exists():
+                    created_dirs.add(relative)
+                if record['before'] is not None and record['after'] is None:
+                    removed_dirs.add(relative)
+                parent = parent.parent
+        entry = {"schema": 2, "repo": str(self.repo.path.resolve()),
+                 "created_dirs": sorted(created_dirs),
+                 "sync_dir": str(self.sync_dir.resolve()), "head": self.repo.head_sha(),
+                 "version": version.number, "previous": previous, "state": "committing",
+                 "files": files, "lock_token": uuid.uuid4().hex}
+        self._validate_transaction(entry)
+        journal.write(entry)  # every preimage and planned write durable BEFORE mutation
+        for name, record in files.items():
+            if name == marker_name:
+                continue
+            target = owned_path(self.repo.path, name)
+            if image(target) != record["before"]:
+                raise UnsafePathError("External edit before write; journal retained")
+            put_image(target, record["after"])
+        self._prune_empty_dirs(list(removed_dirs))
+        # Keep this explicit seam: a crash before marker is recoverable from the WAL.
+        write_version_file(self.sync_dir, version.number)
         signature = author_signature(version.author, authors, self.options.email_domain)
         self.plugins.emit("before_commit", version=version, work_dir=self.sync_dir, author=signature)
-        sha = self.repo.commit_all(message=version.comment, author=signature, date=version.date)
-        journal.write({"version": version.number, "state": "committed", "sha": sha or ""})
+        def prepared(sha):
+            entry['sha'] = sha
+            journal.write(entry)
+
+        sha = self.repo.commit_all(message=version.comment, author=signature, date=version.date,
+                                   records=files, expected_head=entry['head'], prepared=prepared,
+                                   lock_token=entry['lock_token'])
+        entry.update(state='committed', sha=sha)
+        journal.write(entry)
         log.info("Версия %s зафиксирована (%s)", version.number, sha or "без изменений")
         return sha
 
@@ -484,6 +601,7 @@ class SyncManager:
                 log.info("Новых версий нет")
                 return
 
+            self._baseline = self._target_state()
             authors = read_authors_file(self.sync_dir / AUTHORS_FILE_NAME)
             temp_root = self._temp_root()
             window = max(self.options.jobs, 1) + max(self.options.queue_limit, 0)
@@ -521,22 +639,33 @@ class SyncManager:
 
                         previous = result.committed[-1] if result.committed else current
                         try:
+                            self.repo.last_commit_ack = None
                             self._commit_version(version, export_dir, authors, previous)
                         except BaseException as exc:  # noqa: BLE001
                             result.failed_version = version.number
                             result.error = exc
-                            # Коммита не было: снимаем собственные записи до подтверждённого
-                            # состояния, чтобы следующий запуск не считал их чужой грязью.
-                            entry = self._journal().read() or {}
-                            self._rollback_to_confirmed(list(entry.get("written", [])))
-                            self._journal().clear()
-                            write_version_file(self.sync_dir, previous)
+                            if self.repo.last_commit_ack:
+                                result.committed.append(version.number)
+                                result.post_commit = True
+                                result.error = PostCommitError(f'Commit durable; bookkeeping failed: {exc}')
+                                break
+                            entry = self._journal().read()
+                            if entry is not None:
+                                if entry.get('sha') and self.repo.head_sha() == entry['sha']:
+                                    result.committed.append(version.number)
+                                    result.post_commit = True
+                                    result.error = PostCommitError(
+                                        f'Commit durable; bookkeeping failed: {exc}')
+                                else:
+                                    self._rollback_to_confirmed(entry)
+                                    self._journal().clear()
                             break
                         finally:
                             if self.options.cleanup_temp:
                                 shutil.rmtree(export_dir, ignore_errors=True)
 
                         result.committed.append(version.number)
+                        self._baseline = self._target_state()
                         try:
                             # Коммит уже зафиксирован: ошибка обработчика не отменяет его.
                             self.plugins.emit("after_commit", version=version,
@@ -572,27 +701,63 @@ class SyncManager:
 
     # --- прочие команды ----------------------------------------------------
 
-    def init_working_copy(self, generate_authors: bool = True) -> None:
-        """Готовит рабочую копию: git init + служебные файлы AUTHORS/VERSION."""
-        self.repo.init()
-        self.sync_dir = self._resolve_sync_dir()
-        self.sync_dir.mkdir(parents=True, exist_ok=True)
-        version_path = version_file_path(self.sync_dir)
-        if not version_path.exists():
-            write_version_file(self.sync_dir, 0)
-        authors_path = self.sync_dir / AUTHORS_FILE_NAME
-        if generate_authors and not authors_path.exists():
-            from .authors import write_primary_authors_file
-            from .storage_report import authors_from_report
+    def init_working_copy(self, generate_authors: bool = True, *, raise_on_error: bool = False) -> bool:
+        """Returns False on lock contention, or raises when explicitly requested."""
+        from .errors import LockBusyError
 
-            history = self.backend.fetch_history(1)
-            write_primary_authors_file(
-                authors_path, authors_from_report(history), self.options.email_domain
-            )
+        try:
+            with exclusive_lock(resolve_lock_path(self.work_dir), timeout=self.options.lock_timeout):
+                self.sync_dir = self._resolve_sync_dir()
+                self.repo.init()
+                self._reconcile_journal(SyncResult())
+                self.sync_dir.mkdir(parents=True, exist_ok=True)
+                version_path = version_file_path(self.sync_dir)
+                if not version_path.exists():
+                    write_version_file(self.sync_dir, 0)
+                authors_path = self.sync_dir / AUTHORS_FILE_NAME
+                if generate_authors and not authors_path.exists():
+                    from .authors import write_primary_authors_file
+                    from .storage_report import authors_from_report
 
-    def set_version(self, version: int) -> None:
-        self.sync_dir = self._resolve_sync_dir()
-        write_version_file(self.sync_dir, version)
+                    history = self.backend.fetch_history(1)
+                    write_primary_authors_file(
+                        authors_path, authors_from_report(history), self.options.email_domain
+                    )
+            return True
+        except LockBusyError:
+            if raise_on_error:
+                raise
+            return False
+
+    def set_version(self, version: int, *, commit: bool = False,
+                    author: str = "gitsync <gitsync@localhost>", raise_on_error: bool = False) -> bool:
+        from .errors import LockBusyError
+
+        try:
+            with exclusive_lock(resolve_lock_path(self.work_dir), timeout=self.options.lock_timeout):
+                self.sync_dir = self._resolve_sync_dir()
+                if commit and not self.repo.is_repository():
+                    raise VersionFileError("set-version --commit requires a Git repository")
+                if self.repo.is_repository():
+                    self._reconcile_journal(SyncResult())
+                path = version_file_path(self.sync_dir)
+                name = self._rel_to_repo(path)
+                owned_path(self.repo.path, name)
+                before = image(path)
+                head = self.repo.head_sha() if commit else None
+                index = index_entries(self.repo) if commit else {}
+                write_version_file(self.sync_dir, version)
+                if commit:
+                    after = image(path)
+                    record = {"before": before, "after": after,
+                              "index_before": index.get(name), "index_after": blob_entry(self.repo, after)}
+                    self.repo.commit_all(message=f"Установлена версия хранилища {version}",
+                                         author=author, records={name: record}, expected_head=head)
+            return True
+        except LockBusyError:
+            if raise_on_error:
+                raise
+            return False
 
     def needs_sync(self) -> bool:
         self.sync_dir = self._resolve_sync_dir()

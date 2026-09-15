@@ -24,12 +24,15 @@ def version_file_path(work_dir: str | Path) -> Path:
 
 def write_version_file(work_dir: str | Path, version: int | str = "0") -> Path:
     """Пишет VERSION атомарно: сначала временный файл рядом, затем замена."""
-    path = version_file_path(work_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    import base64
+    import os
+
+    from .transaction import owned_path, put_image
+
+    path = owned_path(Path(work_dir), VERSION_FILE_NAME)
     body = '<?xml version="1.0" encoding="UTF-8"?>\n' f"<VERSION>{version}</VERSION>\n"
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(body, encoding="utf-8", newline="\n")
-    tmp.replace(path)
+    put_image(path, {'data': base64.b64encode(body.encode()).decode(),
+                     'mode': 0o666 if os.name == 'nt' else 0o644})
     return path
 
 
