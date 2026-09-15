@@ -79,6 +79,7 @@ Upstream разбирает отчёт не сам, а библиотекой `v
 | `gitsync sync` | догрузка новых версий | `sync` | есть (+`--disable-auto-src`) |
 | `gitsync setversion` | запись номера версии (`--commit`) | `set-version` (`--commit`, общая блокировка writer'а) | есть |
 | `gitsync all` | пакетная обработка нескольких хранилищ | `sync-all` (JSON-конфиг, `--name`, `disable`) | частично (JSON-схема своя; чужая схема отвергается явно, а не выполняется как ноль хранилищ) |
+| — (upstream: одно хранилище — одна рабочая копия) | несколько хранилищ базы в одном репозитории Git | `sync-all` с `repository` + `subtree` (по подкаталогу на источник, свой `VERSION`/`AUTHORS`, коммиты по путям источника) | расширено, см. [docs/monorepo.md](monorepo.md) |
 | `gitsync plugins list/install/enable/disable/clear/init` | управление плагинами OneScript | `plugins list` | частично (см. §5) |
 | `gitsync usage` | подсказка | `--help` (на русском) | есть |
 | Опции `-v8version`, `-v8path`, `-storage-user`, `-storage-password` | — | одноимённые, кроме пароля | частично |

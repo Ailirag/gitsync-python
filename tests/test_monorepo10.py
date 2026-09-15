@@ -448,7 +448,43 @@ def test_foreign_change_inside_subtree_still_blocks_the_source(shared_repo, stor
     assert "<VERSION>2</VERSION>" in _version(shared_repo / EXT1)
 
 
-# --- M08: параллельная выгрузка внутри источника ---------------------------
+# --- M08: пример манифеста и выгрузка истории в зеркало --------------------
+
+
+def test_example_monorepo_manifest_matches_the_supported_schema():
+    """Пример из examples/ обязан разбираться теми же правилами, что и рабочий конфиг."""
+    from gitsync.cli import _validate_batch_config
+
+    example = Path(__file__).resolve().parent.parent / "examples" / "monorepo-base.json"
+    config = json.loads(example.read_text(encoding="utf-8"))
+
+    entries = _validate_batch_config(config)
+
+    assert [entry["name"] for entry in entries] == [CONFIG, EXT1, EXT2]
+    repository = Path(config["repository"])
+    assert [Path(entry["workdir"]) for entry in entries] == [repository / name
+                                                             for name in (CONFIG, EXT1, EXT2)]
+    assert all(entry["jobs"] == 2 and entry["init"] for entry in entries)
+
+
+def test_history_of_all_three_sources_pushes_to_a_bare_mirror_byte_for_byte(
+        shared_repo, storages, tmp_path):
+    config = _manifest(tmp_path / "монорепо.json", shared_repo, storages, tmp_path)
+    assert main(["sync-all", "--config", str(config)]) == 0
+    mirror = tmp_path / "зеркало.git"
+    _git(tmp_path, "init", "--bare", "-b", "main", str(mirror))
+
+    _git(shared_repo, "push", str(mirror), "main")
+
+    assert _git(mirror, "rev-list", "--reverse", "main").split() == _commits(shared_repo)
+    for name in storages:
+        assert _git(mirror, "rev-parse", f"main:{name}").strip() == _tree_sha(shared_repo, name)
+        assert _git(mirror, "show", f"main:{name}/VERSION") == _version(shared_repo / name)
+    assert _git(mirror, "log", "--format=%an|%ae|%ad|%s", "--date=iso", "main") == \
+           _git(shared_repo, "log", "--format=%an|%ae|%ad|%s", "--date=iso", "HEAD")
+
+
+# --- M09: параллельная выгрузка внутри источника ---------------------------
 
 
 def test_source_inside_shared_repository_still_exports_in_parallel(shared_repo, tmp_path):

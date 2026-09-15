@@ -1,0 +1,36 @@
+{
+  "repository": "D:/git/база",
+  "defaults": {
+    "backend": "native",
+    "jobs": 2,
+    "queue_limit": 2,
+    "retries": 1,
+    "init": true,
+    "email_domain": "corp.local",
+    "v8_path": "C:/Program Files/1cv8/8.3.27.2130/bin/1cv8.exe",
+    "v8_version": "8.3.27.2130",
+    "storage_user": "gitsync",
+    "storage_password_env": "GITSYNC_STORAGE_PASSWORD",
+    "temp_root": "D:/gitsync-tmp",
+    "lock_timeout": 1800
+  },
+  "storages": [
+    {
+      "name": "Конфигурация",
+      "subtree": "Конфигурация",
+      "storage_path": "tcp://storage-server/база"
+    },
+    {
+      "name": "Расширение 1",
+      "subtree": "Расширение 1",
+      "storage_path": "tcp://storage-server/база-расширение-1",
+      "extension": "РасширениеПечатныхФорм"
+    },
+    {
+      "name": "Расширение 2",
+      "subtree": "Расширение 2",
+      "storage_path": "tcp://storage-server/база-расширение-2",
+      "extension": "РасширениеОбменов"
+    }
+  ]
+}

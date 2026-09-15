@@ -45,11 +45,20 @@ gitsync-py set-version --workdir ./repo --version 120
 | `sync-all` | пакетная обработка нескольких хранилищ из конфигурационного файла |
 | `plugins list` | показать загруженные Python-плагины |
 
+Несколько хранилищ одной базы (конфигурация и расширения) можно синхронизировать в **один**
+репозиторий, по подкаталогу на источник — см. [docs/monorepo.md](docs/monorepo.md) и пример
+[`examples/monorepo-base.json`](examples/monorepo-base.json):
+
+```bash
+gitsync-py sync-all --config monorepo-base.json
+```
+
 Подробности и полный список опций: `gitsync-py --help`, `gitsync-py sync --help`.
 
 ## Документация
 
 - [Матрица совместимости с upstream](docs/compatibility-matrix.md) — что перенесено, что нет, что не проверено.
+- [Один репозиторий базы: конфигурация и расширения рядом](docs/monorepo.md) — раскладка, гарантии и границы.
 - [Руководство по миграции с gitsync (OneScript)](docs/migration.md).
 - [API плагинов](docs/plugins.md) и его границы.
 - [Журнал разработки и команды тестов](docs/development.md).
