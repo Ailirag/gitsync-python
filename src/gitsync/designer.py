@@ -156,12 +156,15 @@ class DesignerRunner:
         end: int | None = None,
         ib_connection: str = "",
         out_file: Path | None = None,
+        extension: str | None = None,
     ) -> list[str]:
         args = self.base_args(ib_connection, out_file)
         args += self._storage_args(access)
         args += ["/ConfigurationRepositoryReport", str(report_path), "-NBegin", str(begin)]
         if end:
             args += ["-NEnd", str(end)]
+        if extension:
+            args += ["-Extension", extension]
         return args
 
     def build_dump_cfg_args(
@@ -171,6 +174,7 @@ class DesignerRunner:
         cf_path: str | Path,
         ib_connection: str,
         out_file: Path | None = None,
+        extension: str | None = None,
     ) -> list[str]:
         """Выгрузка версии хранилища в CF — проверенный на стенде путь чтения версии.
 
@@ -183,6 +187,8 @@ class DesignerRunner:
         # Порядок обязателен: без "-v" сразу после команды всегда приходит последняя версия.
         if version and version > 0:
             args += ["-v", str(version)]
+        if extension:
+            args += ["-Extension", extension]
         return args
 
     def build_load_cfg_args(

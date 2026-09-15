@@ -18,6 +18,7 @@ import shutil
 import threading
 import time
 import uuid
+from importlib.resources import as_file, files
 from pathlib import Path
 from typing import Protocol
 
@@ -98,9 +99,17 @@ class NativeStorageBackend:
         if context is None:
             worker_dir = self.temp_root / f"worker-{uuid.uuid4().hex}"
             worker_dir.mkdir(parents=True, exist_ok=False)
-            context = (worker_dir, self.ib_factory(worker_dir))
-            self._local.context = context
             self._worker_dirs.append(worker_dir)
+            context = (worker_dir, self.ib_factory(worker_dir))
+            if self.extension:
+                # Upstream СоздатьРасширениеВБазе: generic empty extension, not
+                # a repository fixture. Load before *any* repository operation.
+                template = files("gitsync").joinpath("data/tempExtension.cfe")
+                with as_file(template) as seed:
+                    self.runner.run(self.runner.build_load_cfg_args(
+                        seed, context[1], extension=self.extension
+                    ))
+            self._local.context = context
         return context
 
     def cleanup(self) -> None:
@@ -115,7 +124,8 @@ class NativeStorageBackend:
         # Отчёт конфигуратора — табличный документ (MOXCEL) независимо от расширения файла.
         report_path = worker_dir / f"storage-report-{uuid.uuid4().hex}.mxl"
         args = self.runner.build_report_args(
-            self.access, report_path, begin=max(begin, 1), ib_connection=ib_connection
+            self.access, report_path, begin=max(begin, 1), ib_connection=ib_connection,
+            extension=self.extension,
         )
         self.runner.run(args)
         if not report_path.is_file() or report_path.stat().st_size == 0:
@@ -135,8 +145,11 @@ class NativeStorageBackend:
         worker_dir, ib_connection = self._worker_context()
         dest.mkdir(parents=True, exist_ok=True)
 
-        cf_path = worker_dir / f"v{version}-{uuid.uuid4().hex}.cf"
-        self.runner.run(self.runner.build_dump_cfg_args(self.access, version, cf_path, ib_connection))
+        suffix = ".cfe" if self.extension else ".cf"
+        cf_path = worker_dir / f"v{version}-{uuid.uuid4().hex}{suffix}"
+        self.runner.run(self.runner.build_dump_cfg_args(
+            self.access, version, cf_path, ib_connection, extension=self.extension
+        ))
         if not cf_path.is_file() or cf_path.stat().st_size == 0:
             raise GitSyncError(f"Конфигуратор не выгрузил версию {version} из хранилища: {cf_path}")
 
