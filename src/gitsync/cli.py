@@ -23,9 +23,21 @@ from .designer import DEFAULT_DESIGNER_TIMEOUT, DesignerRunner, StorageAccess
 from .errors import ConfigError, GitSyncError
 from .gitrepo import GitRepo
 from .plugins import PluginHost
-from .sync import SyncManager, SyncOptions
+from .sync import SyncManager, SyncOptions, discover_repo_root
+from .transaction import owned_path
 
 log = logging.getLogger("gitsync.cli")
+
+
+def reject_temp_inside_repo(temp_root: Path, repo_root: Path) -> None:
+    """Временные файлы внутри рабочего дерева — мусор в чужом репозитории и риск очистки."""
+    temp = temp_root.resolve() if temp_root.exists() else temp_root.absolute()
+    repo = repo_root.resolve() if repo_root.exists() else repo_root.absolute()
+    if temp == repo or repo in temp.parents:
+        raise ConfigError(
+            f"Каталог временных файлов <{temp_root}> находится внутри рабочей копии <{repo_root}>. "
+            "Укажите --temp-root вне репозитория."
+        )
 
 
 def build_storage_access(
@@ -63,7 +75,12 @@ def _build_backend(args) -> object:
     )
     # Собственный каталог запуска: общий родитель могут использовать другие репозитории
     # и параллельные запуски, а рабочие каталоги конфигуратора нельзя делить.
-    temp_root = Path(args.temp_root or (Path(args.workdir).parent / ".gitsync-tmp"))
+    # Отсчёт идёт от НАСТОЯЩЕГО корня репозитория: у источника общего репозитория базы
+    # родитель рабочего каталога — сам репозиторий, и выгрузка конфигуратора оказалась бы
+    # внутри чужого рабочего дерева (untracked-мусор для соседних источников).
+    repo_root = discover_repo_root(args.workdir)
+    temp_root = Path(args.temp_root or (repo_root.parent / ".gitsync-tmp"))
+    reject_temp_inside_repo(temp_root, repo_root)
     temp_root = temp_root / f"native-{uuid.uuid4().hex}"
     runner = DesignerRunner(
         v8_path=args.v8_path,
@@ -136,7 +153,12 @@ def _cmd_sync(args) -> int:
         print("Синхронизация остановлена по запросу отмены")
         return 130
     if result.error is not None:
-        print(f"Ошибка на версии {result.failed_version}: {result.error}", file=sys.stderr)
+        # Отказ подготовки (занятая цель, грязная копия, маркер) не привязан к версии:
+        # «Ошибка на версии None» сбивала бы с толку.
+        if result.failed_version is None:
+            print(f"Ошибка: {result.error}", file=sys.stderr)
+        else:
+            print(f"Ошибка на версии {result.failed_version}: {result.error}", file=sys.stderr)
         return 1
     return 0
 
@@ -157,14 +179,48 @@ def _cmd_set_version(args) -> int:
 
 #: Ключи, которые понимает пакетный режим. Неизвестная схема (например, upstream
 #: ``repositories``) отвергается явно: молча выполнить ноль хранилищ и вернуть 0 нельзя.
-_BATCH_TOP_KEYS = frozenset({"storages", "defaults"})
+_BATCH_TOP_KEYS = frozenset({"storages", "defaults", "repository"})
 _BATCH_ENTRY_KEYS = frozenset({
-    "name", "disable", "disabled", "workdir", "backend", "fixture_root", "storage_path",
+    "name", "disable", "disabled", "workdir", "subtree", "init", "no_authors", "backend",
+    "fixture_root", "storage_path",
     "storage_user", "storage_password_env", "storage_password_file", "v8_path", "v8_version",
     "extension", "designer_timeout", "jobs", "queue_limit", "retries", "temp_root",
     "email_domain", "keep_temp", "lock_timeout", "limit", "allow_dirty", "disable_auto_src",
     "plugins",
 })
+
+
+def _resolve_subtree(repository: str, subtree: object, position: int) -> str:
+    """Подкаталог источника внутри общего репозитория: только относительный безопасный путь."""
+    if not isinstance(subtree, str) or not subtree.strip():
+        raise ConfigError(f"Хранилище №{position}: <subtree> должен быть непустой строкой")
+    normalized = subtree.replace("\\", "/").strip("/")
+    if not normalized:
+        raise ConfigError(f"Хранилище №{position}: <subtree> не может указывать на сам репозиторий")
+    try:
+        target = owned_path(Path(repository), normalized)
+    except GitSyncError as exc:
+        raise ConfigError(f"Хранилище №{position}: недопустимый <subtree> <{subtree}>: {exc}") from exc
+    return str(target)
+
+
+def _reject_overlapping_workdirs(entries: list[dict]) -> None:
+    """Перекрытие рабочих каталогов = молчаливое уничтожение соседнего источника."""
+    seen: list[tuple[str, str]] = []
+    for entry in entries:
+        key = os.path.normcase(os.path.normpath(str(Path(entry["workdir"]).absolute())))
+        for other_key, other_name in seen:
+            if key == other_key:
+                raise ConfigError(
+                    f"Хранилища <{other_name}> и <{entry['name']}> используют один каталог "
+                    f"<{entry['workdir']}>: у каждого источника должен быть свой подкаталог."
+                )
+            if key.startswith(other_key + os.sep) or other_key.startswith(key + os.sep):
+                raise ConfigError(
+                    f"Каталоги хранилищ <{other_name}> и <{entry['name']}> вложены друг в друга "
+                    f"(<{entry['workdir']}>): источники должны лежать в непересекающихся подкаталогах."
+                )
+        seen.append((key, entry["name"]))
 
 
 def _validate_batch_config(config: object) -> list[dict]:
@@ -187,6 +243,9 @@ def _validate_batch_config(config: object) -> list[dict]:
     defaults = config.get("defaults", {})
     if not isinstance(defaults, dict):
         raise ConfigError("Ключ <defaults> должен быть объектом")
+    repository = config.get("repository")
+    if repository is not None and (not isinstance(repository, str) or not repository.strip()):
+        raise ConfigError("Ключ <repository> должен быть путём к общему репозиторию Git")
     entries: list[dict] = []
     names: set[str] = set()
     for position, entry in enumerate(storages, 1):
@@ -196,6 +255,22 @@ def _validate_batch_config(config: object) -> list[dict]:
         unknown = sorted(set(merged) - _BATCH_ENTRY_KEYS)
         if unknown:
             raise ConfigError(f"Хранилище №{position}: неизвестные ключи {', '.join(unknown)}")
+        if merged.get("subtree") and merged.get("workdir"):
+            raise ConfigError(
+                f"Хранилище №{position}: задайте либо <subtree> (подкаталог общего репозитория), "
+                "либо <workdir>, но не оба сразу"
+            )
+        if merged.get("subtree"):
+            if not repository:
+                raise ConfigError(
+                    f"Хранилище №{position}: <subtree> требует ключа <repository> с путём к "
+                    "общему репозиторию Git"
+                )
+            merged["workdir"] = _resolve_subtree(repository, merged["subtree"], position)
+        elif repository and not merged.get("workdir"):
+            raise ConfigError(
+                f"Хранилище №{position}: при заданном <repository> укажите <subtree> источника"
+            )
         if not merged.get("workdir"):
             raise ConfigError(f"Хранилище №{position}: не задан workdir")
         name = str(merged.get("name") or merged["workdir"])
@@ -204,6 +279,7 @@ def _validate_batch_config(config: object) -> list[dict]:
         names.add(name)
         merged["name"] = name
         entries.append(merged)
+    _reject_overlapping_workdirs(entries)
     return entries
 
 
@@ -213,6 +289,11 @@ def _cmd_sync_all(args) -> int:
     except ValueError as exc:
         raise ConfigError(f"Файл <{args.config}> не является корректным JSON: {exc}") from exc
     entries = _validate_batch_config(config)
+    repository = config.get("repository") if isinstance(config, dict) else None
+    if repository:
+        # Общий репозиторий базы объявлен явно: создаём именно его, а не подкаталоги-источники.
+        GitRepo(repository).init()
+        print(f"Общий репозиторий: {repository}")
     if args.name:
         selected = [entry for entry in entries if entry["name"] in set(args.name)]
         missing = sorted(set(args.name) - {entry["name"] for entry in entries})
@@ -251,8 +332,12 @@ def _cmd_sync_all(args) -> int:
             allow_dirty=merged.get("allow_dirty", False),
             disable_auto_src=merged.get("disable_auto_src", False),
             plugin=merged.get("plugins", []),
+            no_authors=merged.get("no_authors", False),
+            log_level=getattr(args, "log_level", "INFO"),
         )
         try:
+            if merged.get("init"):
+                _cmd_init(sub)
             code = _cmd_sync(sub)
             if code != 0:
                 failures.append(str(name))

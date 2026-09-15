@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -35,6 +36,7 @@ from .errors import (
     DesignerError,
     DirtyWorkingCopyError,
     ExportIncompleteError,
+    LockBusyError,
     PostCommitError,
     StorageVersionMismatchError,
     UnsafePathError,
@@ -233,29 +235,87 @@ class SyncManager:
             return "."
         return relative.as_posix() or "."
 
+    def _journal_name(self) -> str:
+        """Имя журнала транзакции: у каждого источника общего репозитория оно своё.
+
+        В общем репозитории базы (`Конфигурация`, `Расширение 1`, ...) каталог ``.git`` один
+        на все источники. Один журнал на всех означал бы, что оборванная транзакция одного
+        источника блокирует остальные, а перестановка порядка запусков приводила бы к попытке
+        «починить» чужой источник. Корневая раскладка сохраняет прежнее имя файла.
+        """
+        relative = self._rel_to_repo(self.sync_dir)
+        if relative == ".":
+            return JOURNAL_FILE_NAME
+        digest = hashlib.sha256(relative.encode("utf-8")).hexdigest()[:16]
+        return f"gitsync-py-journal-{digest}.json"
+
     def _journal(self) -> _Journal:
-        return _Journal(self._git_dir() / JOURNAL_FILE_NAME)
+        git_dir = self._git_dir()
+        own = _Journal(git_dir / self._journal_name())
+        if own.path.name == JOURNAL_FILE_NAME or own.path.exists():
+            return own
+        # Совместимость: журнал, оставленный прежней версией в корневом файле, принимается
+        # только если он описывает ЭТОТ же каталог источника.
+        legacy = _Journal(git_dir / JOURNAL_FILE_NAME)
+        try:
+            entry = legacy.read()
+        except ValueError:
+            return own
+        if isinstance(entry, dict) and entry.get("sync_dir") == str(self.sync_dir.resolve()):
+            return legacy
+        return own
 
     # --- состояние рабочей копии ------------------------------------------
 
+    def _status_entries(self) -> list[str]:
+        """Пути из ``git status`` без экранирования: кириллица не должна ломать разбор.
+
+        Без ``-z`` git с включённым ``core.quotepath`` (значение по умолчанию!) отдаёт
+        ``"\\320\\232..."`` вместо ``Конфигурация/AUTHORS``, и любое сравнение с путём
+        источника даёт ложную «грязную копию». Конфигурацию чужого репозитория не меняем.
+        """
+        raw = self.repo.run(["status", "--porcelain", "-z", "--untracked-files=all"]).stdout
+        fields = raw.split("\0")
+        entries: list[str] = []
+        position = 0
+        while position < len(fields):
+            row = fields[position]
+            position += 1
+            if not row:
+                continue
+            entries.append(row[3:])
+            if set(row[:2]) & {"R", "C"}:
+                # Переименование/копирование: вторым полем идёт путь-источник.
+                if position < len(fields) and fields[position]:
+                    entries.append(fields[position])
+                position += 1
+        return entries
+
     def check_working_copy(self) -> None:
-        """Грязная рабочая копия защищается; служебные файлы gitsync внутри цели — исключение."""
-        status = self.repo.run(["status", "--porcelain", "--untracked-files=all"]).stdout
+        """Грязная рабочая копия защищается; служебные файлы gitsync внутри цели — исключение.
+
+        Источник общего репозитория отвечает только за СВОЙ подкаталог: коммит собирается от
+        дерева ``HEAD`` и содержит исключительно пути источника, поэтому чужие правки за
+        пределами подкаталога не могут быть ни испорчены, ни закоммичены. Раскладка «весь
+        репозиторий — одна рабочая копия» проверяется как раньше, целиком.
+        """
         prefix = self._rel_to_repo(self.sync_dir)
-        prefix = "" if prefix == "." else prefix + "/"
+        scoped = prefix != "."
+        prefix = prefix + "/" if scoped else ""
         dirty: list[str] = []
-        for line in status.splitlines():
-            entry = line[3:].strip().strip('"')
+        for entry in self._status_entries():
             if not entry:
                 continue
             if entry.startswith(prefix):
                 top = entry[len(prefix):].split("/")[0]
                 if top in SERVICE_NAMES:
                     continue
+            elif scoped:
+                continue
             dirty.append(entry)
         if dirty:
             raise DirtyWorkingCopyError(
-                f"В рабочей копии <{self.repo.path}> есть чужие незафиксированные изменения: "
+                f"В рабочей копии <{self.sync_dir}> есть чужие незафиксированные изменения: "
                 + ", ".join(dirty[:20])
                 + "\nЗафиксируйте или уберите их (или используйте --allow-dirty, если это ваши артефакты)."
             )
@@ -270,19 +330,68 @@ class SyncManager:
         match = read_version_from_text(result.stdout)
         return match
 
+    def _subtree_has_history(self) -> bool:
+        """Есть ли в ``HEAD`` файлы ЭТОГО источника.
+
+        В общем репозитории базы чужие коммиты (README, соседние источники) не означают, что
+        у нашего подкаталога уже есть история: считать их своей историей — значит навсегда
+        запретить первый запуск нового источника.
+        """
+        if self.repo.head_sha() is None:
+            return False
+        relative = self._rel_to_repo(self.sync_dir)
+        args = ["ls-tree", "-r", "--name-only", "-z", "HEAD"]
+        if relative != ".":
+            args += ["--", relative + "/"]
+        result = self.repo.run(args, check=False)
+        return result.returncode == 0 and bool(result.stdout.strip("\0").strip())
+
     def _read_marker(self) -> int:
-        """Маркер рабочей копии. Отсутствие маркера в непустом репозитории — авария (fail closed)."""
+        """Маркер рабочей копии. Отсутствие маркера при своей истории — авария (fail closed)."""
         path = version_file_path(self.sync_dir)
         if path.is_file():
             return read_version_file_strict(self.sync_dir)
-        if self.repo.commit_count() > 0:
+        if self._subtree_has_history():
             raise VersionFileError(
-                f"Файл <{path}> отсутствует, хотя репозиторий уже содержит коммиты. "
+                f"Файл <{path}> отсутствует, хотя в git уже есть файлы этого источника. "
                 "Молча начать с нуля нельзя — это повторит всю историю поверх существующей. "
                 "Восстановите файл (git checkout), либо задайте номер командой set-version, "
                 "либо подготовьте новую копию командой init."
             )
         return 0
+
+    def _check_source_isolation(self) -> None:
+        """Источник не лежит внутри другого источника и не содержит чужой маркер внутри себя.
+
+        Перекрытие подкаталогов в общем репозитории — это молчаливое уничтожение соседа:
+        выгрузка версии удаляет из своего подкаталога всё, чего нет в новой версии.
+
+        Проверка касается только раскладки «источник — подкаталог репозитория». Корневая
+        раскладка upstream (весь репозиторий — одна рабочая копия, ``src`` внутри — обычные
+        данные) остаётся прежней: маркер в корне репозитория источником-соседом не считается.
+        """
+        target = self.sync_dir.resolve()
+        root = self.repo.path.resolve()
+        if target == root:
+            return
+        parent = target.parent
+        while parent != root and root in parent.parents:
+            if version_file_path(parent).is_file():
+                raise UnsafePathError(
+                    f"Каталог источника <{self.sync_dir}> вложен в другой источник "
+                    f"(<{version_file_path(parent)}>). Разнесите источники по непересекающимся "
+                    "подкаталогам общего репозитория."
+                )
+            parent = parent.parent
+        for candidate in self.sync_dir.rglob(VERSION_FILE_NAME):
+            if candidate.parent.resolve() == target or not candidate.is_file():
+                continue
+            if read_version_from_text(candidate.read_text(encoding="utf-8-sig", errors="replace")) is None:
+                continue  # не наш маркер: файл с таким именем внутри выгрузки — просто данные
+            raise UnsafePathError(
+                f"Внутри источника <{self.sync_dir}> найден маркер другого источника "
+                f"<{candidate}>. Выгрузка версии уничтожила бы его: разнесите источники."
+            )
 
     # --- транзакция --------------------------------------------------------
 
@@ -332,15 +441,51 @@ class SyncManager:
                             or not re.fullmatch(r"100(?:644|755) [0-9a-f]{40,64} 0", value)):
                         raise UnsafePathError("Invalid index preimage")
 
+    def _subtree_tree(self, commit: str | None) -> str | None:
+        """SHA дерева подкаталога источника в коммите (None — коммита или подкаталога нет)."""
+        if commit is None:
+            return None
+        relative = self._rel_to_repo(self.sync_dir)
+        spec = f"{commit}^{{tree}}" if relative == "." else f"{commit}:{relative}"
+        result = self.repo.run(["rev-parse", "--verify", "--quiet", spec], check=False)
+        return (result.stdout.strip() or None) if result.returncode == 0 else None
+
+    def _baseline_intact(self, head: str | None) -> bool:
+        """Подтверждённое состояние ЭТОГО источника не изменилось с начала транзакции.
+
+        В общем репозитории базы соседний источник штатно двигает ``HEAD``, пока наша
+        транзакция не завершена. Признаком чужого вмешательства поэтому служит не сам факт
+        движения ``HEAD``, а изменение зафиксированного содержимого нашего подкаталога:
+        чужой коммит его не трогает (коммиты собираются по путям источника), а правка
+        снаружи — трогает, и тогда откат по-прежнему запрещён.
+        """
+        current = self.repo.head_sha()
+        if current == head:
+            return True
+        if head is not None and self.repo.run(
+                ["rev-parse", "--verify", "--quiet", head + "^{commit}"], check=False).returncode != 0:
+            return False  # коммит-основание исчез: восстанавливать не от чего
+        return self._subtree_tree(head) == self._subtree_tree(current)
+
+    def _commit_published(self, sha: str | None) -> bool:
+        """Коммит транзакции уже в истории ветки (сосед мог добавить свои коммиты сверху)."""
+        if not sha:
+            return False
+        if self.repo.head_sha() == sha:
+            return True
+        return self.repo.run(["merge-base", "--is-ancestor", sha, "HEAD"], check=False).returncode == 0
+
     def _rollback_to_confirmed(self, entry: dict) -> None:
         """Restore recorded preimages only if every affected path is still ours.
 
-        A conflicting editor/index/HEAD stops recovery, retaining the entire journal.
-        The mutable index is never treated as a committed baseline.
+        A conflicting editor/index/committed state stops recovery, retaining the entire
+        journal. The mutable index is never treated as a committed baseline.
         """
         self._validate_transaction(entry)
-        if self.repo.head_sha() != entry.get("head"):
-            raise UnsafePathError("HEAD changed; refusing rollback, journal retained")
+        if not self._baseline_intact(entry.get("head")):
+            raise UnsafePathError(
+                "Зафиксированное состояние источника изменилось; откат запрещён, журнал сохранён"
+            )
         with locked_index(self.repo, entry["lock_token"]) as env:
             current_index = index_entries(self.repo, env)
             for name, record in entry["files"].items():
@@ -365,6 +510,36 @@ class SyncManager:
             except OSError:
                 pass  # absent or nonempty: never recurse into a concurrent editor's files
 
+    def _check_index_lock(self) -> None:
+        """Чужой ``index.lock`` — понятный отказ, а не FileExistsError из глубины транзакции."""
+        lock = self._git_dir() / "index.lock"
+        if not lock.exists():
+            return
+        owner = None
+        if not lock.is_symlink():
+            try:
+                content = lock.read_bytes()
+            except OSError:
+                content = b""
+            for path in sorted(self._git_dir().glob("gitsync-py-journal*.json")):
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                token = data.get("lock_token")
+                if isinstance(token, str) and content == ("gitsync:" + token).encode():
+                    owner = data.get("sync_dir")
+                    break
+        if owner:
+            raise LockBusyError(
+                f"Индекс Git занят незавершённой транзакцией источника <{owner}>. "
+                "Сначала запустите синхронизацию этого источника — он снимет свою транзакцию сам."
+            )
+        raise LockBusyError(
+            f"Индекс Git заблокирован файлом <{lock}>: с репозиторием работает другой процесс. "
+            "Дождитесь его завершения; чужую блокировку gitsync-py не снимает."
+        )
+
     def _reconcile_journal(self, result: SyncResult) -> None:
         journal = self._journal()
         entry = journal.read()
@@ -376,7 +551,7 @@ class SyncManager:
             if lock.is_symlink() or lock.read_bytes() != ('gitsync:' + entry['lock_token']).encode():
                 raise UnsafePathError('Unowned index.lock; journal retained')
             lock.unlink()  # canonical lifecycle lock proves the previous GitSync owner exited
-        if entry.get("sha") and self.repo.head_sha() == entry["sha"]:
+        if self._commit_published(entry.get("sha")):
             with locked_index(self.repo, entry['lock_token']) as env:
                 current = index_entries(self.repo, env)
                 updates = {}
@@ -600,9 +775,13 @@ class SyncManager:
         lock_path = self._git_dir() / LOCK_FILE_NAME
         with (exclusive_lock(lock_path, timeout=self.options.lock_timeout),
               self._run_resources(result) as run_dirs):
+            self._check_source_isolation()
             # Незавершённая транзакция прошлого запуска снимается ДО проверки грязной копии:
             # иначе собственные недописанные файлы выглядят как чужие правки.
             self._reconcile_journal(result)
+            # Своя транзакция уже снята; оставшийся index.lock — чужой, и коммит всё равно
+            # не состоится: понятный отказ лучше FileExistsError из глубины транзакции.
+            self._check_index_lock()
             self.plugins.emit("before_sync", work_dir=self.sync_dir)
             if not self.options.allow_dirty:
                 self.check_working_copy()
@@ -684,7 +863,7 @@ class SyncManager:
                                 break
                             entry = self._journal().read()
                             if entry is not None:
-                                if entry.get('sha') and self.repo.head_sha() == entry['sha']:
+                                if self._commit_published(entry.get('sha')):
                                     result.committed.append(version.number)
                                     result.post_commit = True
                                     result.error = PostCommitError(
@@ -763,12 +942,11 @@ class SyncManager:
 
     def init_working_copy(self, generate_authors: bool = True, *, raise_on_error: bool = False) -> bool:
         """Returns False on lock contention, or raises when explicitly requested."""
-        from .errors import LockBusyError
-
         try:
             with exclusive_lock(resolve_lock_path(self.work_dir), timeout=self.options.lock_timeout):
                 self.sync_dir = self._resolve_sync_dir()
                 self.repo.init()
+                self._check_source_isolation()
                 self._reconcile_journal(SyncResult())
                 self.sync_dir.mkdir(parents=True, exist_ok=True)
                 version_path = version_file_path(self.sync_dir)
@@ -791,8 +969,6 @@ class SyncManager:
 
     def set_version(self, version: int, *, commit: bool = False,
                     author: str = "gitsync <gitsync@localhost>", raise_on_error: bool = False) -> bool:
-        from .errors import LockBusyError
-
         try:
             with exclusive_lock(resolve_lock_path(self.work_dir), timeout=self.options.lock_timeout):
                 self.sync_dir = self._resolve_sync_dir()
@@ -855,7 +1031,7 @@ class SyncManager:
             journal.clear()
         except Exception as exc:
             if (self.repo.last_commit_ack
-                    or (entry.get('sha') and self.repo.head_sha() == entry['sha'])):
+                    or self._commit_published(entry.get('sha'))):
                 # The ref is the acknowledgement: never roll back a published commit.
                 raise PostCommitError(f'Commit durable; bookkeeping failed: {exc}') from exc
             if wal_started:
@@ -871,11 +1047,21 @@ class SyncManager:
 
 
 def discover_repo_root(work_dir: str | Path) -> Path:
-    """Настоящий корень Git для каталога или он сам, если репозитория ещё нет."""
+    """Настоящий корень Git для каталога или он сам, если репозитория ещё нет.
+
+    Каталога может ещё не быть: в общем репозитории базы подкаталог источника создаёт сам
+    инструмент. Тогда git спрашивается у ближайшего существующего предка — иначе в
+    несуществующем подкаталоге появился бы ВЛОЖЕННЫЙ ``.git``, а общий репозиторий остался
+    бы нетронутым (и весь подкаталог — untracked).
+    """
     path = Path(work_dir)
-    if not path.is_dir():
-        return path
-    result = GitRepo(path).run(["rev-parse", "--show-toplevel"], check=False)
+    probe = path.absolute()
+    while not probe.is_dir():
+        parent = probe.parent
+        if parent == probe:
+            return path
+        probe = parent
+    result = GitRepo(probe).run(["rev-parse", "--show-toplevel"], check=False)
     if result.returncode == 0 and result.stdout.strip():
         root = Path(result.stdout.strip())
         if root.exists():
