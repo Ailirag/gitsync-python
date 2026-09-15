@@ -290,3 +290,15 @@ def test_recreated_storage_is_refused_even_when_range_is_empty(tmp_path):
 
     assert GitRepo(work_dir).commit_count() == 20
     assert read_version_file(work_dir) == 20
+
+
+@pytest.mark.parametrize("message", ["invalid credentials", "Пользователь уже аутентифицирован в хранилище"])
+def test_unclassified_native_failure_is_not_retried(work_dir, tmp_path, message):
+    from gitsync.errors import DesignerError
+
+    backend = FakeStorageBackend(_versions(1), fail_versions={1: DesignerError(message)})
+    manager = SyncManager(work_dir, backend, SyncOptions(jobs=1, retries=3, temp_root=tmp_path / "tmp"))
+    result = manager.sync(raise_on_error=False)
+    assert isinstance(result.error, DesignerError)
+    assert result.committed == []
+    assert backend.attempts == {1: 1}

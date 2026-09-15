@@ -31,6 +31,7 @@ from pathlib import Path, PurePath
 from .authors import author_signature, read_authors_file
 from .errors import (
     CancelledError,
+    DesignerError,
     DirtyWorkingCopyError,
     ExportIncompleteError,
     PostCommitError,
@@ -429,7 +430,9 @@ class SyncManager:
                 self._verify_export(version, dest)
                 validate_export_tree(dest)
                 return dest
-            except (CancelledError, UnsafePathError):
+            except (CancelledError, UnsafePathError, DesignerError):
+                # Native errors are not classified transient: never blindly retry
+                # invalid authentication, same-login contention or a Designer timeout.
                 shutil.rmtree(dest, ignore_errors=True)
                 raise
             except BaseException as exc:  # noqa: BLE001 — решение о повторе принимаем ниже

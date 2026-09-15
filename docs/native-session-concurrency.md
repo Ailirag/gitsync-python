@@ -15,7 +15,10 @@ Separate scratch IBs do not isolate that repository login.
 - The Git writer remains ordered and protected by its existing target/transaction
   locks. These locks and recovery behavior have not been modified.
 - No new retry, authentication exception suppression, extra storage users or
-  repository mutations. Admission wait is bounded by Designer timeout. Cancellation
+  repository mutations. Unclassified DesignerError (including authentication,
+  contention and DesignerTimeoutError) now bypasses generic export retries even
+  when --retries is positive. No classified native transient retry is introduced.
+  Admission wait is bounded by Designer timeout. Cancellation
   is rechecked after admission before starting a repository download; an already
   waiting worker may wait until the bounded lock timeout.
 
