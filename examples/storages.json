@@ -1,0 +1,26 @@
+{
+  "defaults": {
+    "backend": "native",
+    "jobs": 3,
+    "queue_limit": 3,
+    "retries": 2,
+    "email_domain": "corp.local",
+    "v8_path": "C:/Program Files/1cv8/8.3.24.1234/bin/1cv8.exe",
+    "storage_password_env": "GITSYNC_STORAGE_PASSWORD"
+  },
+  "storages": [
+    {
+      "name": "Торговля",
+      "workdir": "D:/git/trade",
+      "storage_path": "tcp://storage-server/trade",
+      "storage_user": "gitsync"
+    },
+    {
+      "name": "Бухгалтерия",
+      "workdir": "D:/git/accounting",
+      "storage_path": "tcp://storage-server/accounting",
+      "storage_user": "gitsync",
+      "jobs": 2
+    }
+  ]
+}

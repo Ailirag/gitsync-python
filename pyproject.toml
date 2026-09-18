@@ -1,0 +1,36 @@
+[project]
+name = "gitsync-py"
+version = "0.1.0"
+description = "Многопоточная выгрузка хранилища конфигурации 1С в Git (порт oscript-library/gitsync)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MPL-2.0" }
+dependencies = []
+
+[project.scripts]
+gitsync-py = "gitsync.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gitsync"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "native: требует настоящую платформу 1С:Предприятие (по умолчанию пропускается)",
+]
+
+[tool.ruff]
+line-length = 110
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["B008"]

@@ -1,0 +1,69 @@
+# Контекст сборки: только исходный код, метаданные пакета и тесты.
+# Всё остальное либо не нужно образу, либо не должно в него попасть.
+
+# --- секреты и учётные данные (никогда не попадают в контекст) ---
+*.key
+*.pem
+*.pfx
+*.p12
+*.lic
+*.licence
+*.license
+**/secrets/
+**/*password*
+**/*secret*
+**/*credential*
+.netrc
+.ssh/
+.env
+.env.*
+
+# --- дистрибутивы платформы 1С: в контексте им не место ---
+# Приватный образ получает установочный комплект отдельным bind-монтированием
+# (см. docker/Dockerfile.native), а не через контекст сборки.
+*.deb
+*.rpm
+*.run
+*.exe
+*.msi
+*.cf
+*.dt
+# tempExtension.cfe — часть пакета (MPL-2.0), см. src/gitsync/data/README.md
+*.cfe
+!src/gitsync/data/tempExtension.cfe
+
+# --- история и служебные каталоги репозитория ---
+.git
+.gitignore
+.gitattributes
+.github/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# --- кэши и мусор ---
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- журналы, стенды и рабочие артефакты ---
+*.log
+logs/
+run/
+tmp/
+temp/
+.gitsync-tmp/
+**/designer-out/
+
+# --- что НАМЕРЕННО остаётся в контексте ---
+# tests/, docs/, examples/ нужны цели `test` образа (docker/Dockerfile.core):
+# набор тестов читает docs/setup-guide.md и examples/ как исполняемый контракт.
+# В образ ВЫПОЛНЕНИЯ (цель `core`) они не копируются — там только src/ и метаданные
+# пакета. Это проверяется приёмкой: в готовом образе нет ни tests/, ни .git.
