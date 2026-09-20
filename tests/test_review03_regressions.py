@@ -96,8 +96,11 @@ def test_set_version_real_process_exit_reconciles_content_bound_wal(tmp_path, ph
 
     import gitsync
 
-    src = Path(__file__).resolve().parents[1] / 'src'
-    assert Path(gitsync.__file__).resolve() == src / 'gitsync/__init__.py'
+    # Каталог импорта берётся у самого модуля: тест обязан проверять ТОТ код,
+    # который импортирован, а не предполагать раскладку дерева исходников
+    # (при установке колеса — в контейнере — исходников рядом нет).
+    src = Path(gitsync.__file__).resolve().parent.parent
+    assert (src / 'gitsync' / '__init__.py').is_file()
     work = tmp_path / 'repo'
     repo = _seed(work, 0, {'object.txt': 'old'})
     initial = repo.head_sha()

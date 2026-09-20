@@ -1,0 +1,161 @@
+# ВНИМАНИЕ: прежний архитектурный пример, не штатный native-профиль stage19r1.
+# read_only root не предоставляет writable private scratch и мешает инициализации UID.
+# Для проверенного способа запуска: docs/OPERATIONS_RU.md, examples/gitsync-run.sh.
+# docker compose config проверяет лишь схему, а не работоспособность этого профиля.
+# Запуск gitsync-py в контейнере.
+#
+# Файл рассчитан на работу из каталога docker/ вместе с файлом окружения .env
+# (образец — docker/env.example). Переменные с «?» обязательны: без них compose
+# откажется запускаться, и это намеренно — молча подставленное значение здесь
+# означает либо чужой каталог, либо неверное время в истории Git.
+#
+#   docker compose --env-file .env config     # проверить настройку, ничего не запуская
+#   docker compose --env-file .env run --rm sync-fixture
+#   docker compose --env-file .env run --rm sync            # нужен приватный образ с 1С
+#   docker compose --env-file .env run --rm push            # ОТДЕЛЬНЫЙ шаг отправки
+#
+# Отправки в удалённый репозиторий в синхронизации НЕТ. Это разные службы с
+# разными правами: у синхронизации нет ключа Git, у отправки нет пароля хранилища.
+
+x-common: &common
+  init: true                      # правильный процесс №1: сигналы и зомби-процессы
+  user: "${GITSYNC_UID:?укажите UID владельца каталогов на хосте}:${GITSYNC_GID:?укажите GID}"
+  read_only: true                 # запись — только в явно подключённые тома
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  environment:
+    HOME: /home/app
+    LANG: C.UTF-8
+    LC_ALL: C.UTF-8
+    GITSYNC_SESSION_DIR: /var/lib/gitsync/sessions
+    GITSYNC_REPO: /repo
+    # Часовой пояс ИСТОЧНИКА: время версии приходит из хранилища без смещения.
+    TZ: "${SOURCE_TZ:?укажите часовой пояс хранилища, например Europe/Moscow}"
+  tmpfs:
+    # Системный /tmp — небольшой и в памяти. Рабочие выгрузки сюда НЕ идут:
+    # база 1С и XML бывают крупными, для них отдельный том worktmp.
+    - /tmp:rw,nosuid,nodev,mode=1777,size=64m
+
+services:
+  # --- синхронизация с настоящим хранилищем (нужен приватный образ с 1С) ------
+  sync:
+    <<: *common
+    image: "${NATIVE_IMAGE:-gitsync-py:native}"
+    stop_grace_period: "${STOP_GRACE:-70m}"
+    volumes:
+      - type: bind
+        source: "${REPO_HOST:?путь к рабочей копии Git на хосте}"
+        target: /repo
+      - type: bind
+        source: "${CONFIG_HOST:?каталог с манифестом, ВНЕ репозитория}"
+        target: /config
+        read_only: true
+      - type: volume
+        source: worktmp
+        target: /work/tmp
+      - type: volume
+        source: apphome
+        target: /home/app
+      - type: volume
+        source: sessions
+        target: /var/lib/gitsync/sessions
+      # Файловое хранилище конфигурации, если оно подключается как каталог, а не
+      # по tcp://. Раскомментируйте вместе с путём в .env.
+      #
+      # ПОЧЕМУ НЕ read_only ПО УМОЛЧАНИЮ. Инструмент хранилище только читает:
+      # ни захвата, ни фиксации, ни привязки он не делает. Но сама платформа при
+      # файловом доступе может писать служебные файлы — на Linux это НЕ проверено.
+      # Поэтому: сначала подключите КОПИЮ хранилища как read_only и убедитесь, что
+      # отчёт по версиям и выгрузка проходят. Если не проходят — оставьте запись,
+      # но только на копии или тестовом хранилище, и никогда молча на рабочем.
+      # Надёжнее вообще не раздавать файловый доступ, а работать через сервер
+      # хранилища (tcp://...): тогда этот том не нужен.
+      # - type: bind
+      #   source: "${STORAGE_HOST:?путь к хранилищу на хосте}"
+      #   target: /storage/main
+      #   read_only: true
+    secrets: [storage_password]
+    command: ["sync-all", "--config", "/config/storages.json"]
+
+  # --- герметичный прогон: тот же конвейер, но без платформы 1С --------------
+  # Это проверка установки и прав, а не доказательство работы с хранилищем.
+  sync-fixture:
+    <<: *common
+    image: "${CORE_IMAGE:-gitsync-py:core}"
+    stop_grace_period: 2m
+    volumes:
+      - type: bind
+        source: "${REPO_HOST:?путь к рабочей копии Git на хосте}"
+        target: /repo
+      - type: bind
+        source: "${CONFIG_HOST:?каталог с манифестом, ВНЕ репозитория}"
+        target: /config
+        read_only: true
+      - type: bind
+        source: "${FIXTURE_HOST:-./fixture}"
+        target: /fixture
+        read_only: true
+      - type: volume
+        source: worktmp
+        target: /work/tmp
+      - type: volume
+        source: apphome
+        target: /home/app
+      - type: volume
+        source: sessions
+        target: /var/lib/gitsync/sessions
+    command: ["sync-all", "--config", "/config/storages-fixture.json"]
+
+  # --- отдельная отправка в удалённый репозиторий ----------------------------
+  # Запускается ВРУЧНУЮ и только после проверки результата синхронизации.
+  # Ни пароля хранилища, ни платформы 1С здесь нет; образ ядра и голый git.
+  push:
+    <<: *common
+    image: "${CORE_IMAGE:-gitsync-py:core}"
+    entrypoint: ["git"]
+    environment:
+      HOME: /home/app
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      GIT_TERMINAL_PROMPT: "0"
+      # Ключ подключается только для чтения и только этой службе.
+      GIT_SSH_COMMAND: >-
+        ssh -i /run/secrets/git_ssh_key
+        -o IdentitiesOnly=yes
+        -o StrictHostKeyChecking=yes
+        -o UserKnownHostsFile=/config/known_hosts
+    volumes:
+      - type: bind
+        source: "${REPO_HOST:?путь к рабочей копии Git на хосте}"
+        target: /repo
+      - type: bind
+        source: "${CONFIG_HOST:?каталог с манифестом, ВНЕ репозитория}"
+        target: /config
+        read_only: true
+      - type: volume
+        source: apphome
+        target: /home/app
+    secrets: [git_ssh_key]
+    command: ["-C", "/repo", "push", "origin", "HEAD"]
+
+volumes:
+  # Том блокировок входа в хранилище. Он ВНЕШНИЙ и создаётся один раз руками:
+  #     docker volume create gitsync-sessions
+  # Так он не получает префикс проекта и остаётся общим для всех установок на
+  # хосте. Иначе у второго compose-проекта появился бы свой том, блокировка
+  # перестала бы быть общей, и два конфигуратора вошли бы в одно хранилище под
+  # одним логином. Если тома нет, compose откажется запускаться — это намеренно.
+  sessions:
+    external: true
+    name: "${SESSIONS_VOLUME:-gitsync-sessions}"
+  worktmp:
+  apphome:
+
+secrets:
+  # Файлы монтируются в /run/secrets только для чтения. В standalone-compose это
+  # обычные файлы хоста, а не хранилище секретов: права на исходный файл
+  # установите сами (владелец — тот же UID, режим 0400).
+  storage_password:
+    file: "${STORAGE_PASSWORD_FILE:?файл с паролем хранилища, вне репозитория}"
+  git_ssh_key:
+    file: "${GIT_SSH_KEY_FILE:?приватный ключ для отправки в Git, вне репозитория}"

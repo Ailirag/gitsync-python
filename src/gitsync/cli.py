@@ -23,10 +23,15 @@ from .designer import DEFAULT_DESIGNER_TIMEOUT, DesignerRunner, StorageAccess
 from .errors import ConfigError, GitSyncError
 from .gitrepo import GitRepo
 from .plugins import PluginHost
+from .safepath import default_scratch_root
 from .sync import SyncManager, SyncOptions, discover_repo_root
 from .transaction import owned_path
 
 log = logging.getLogger("gitsync.cli")
+
+#: Код возврата «остановлено по запросу оператора» (общепринятый 128 + SIGINT).
+#: Планировщик и `docker stop` обязаны отличать штатную остановку от сбоя.
+EXIT_CANCELLED = 130
 
 
 def reject_temp_inside_repo(temp_root: Path, repo_root: Path) -> None:
@@ -64,7 +69,9 @@ def _build_backend(args) -> object:
 
     if not args.v8_path:
         raise GitSyncError(
-            "Для нативного бэкенда укажите --v8-path (полный путь к 1cv8.exe/1cv8). "
+            "Для нативного бэкенда укажите --v8-path — полный путь к исполняемому файлу "
+            "конфигуратора: в Windows это ...\\1cv8\\<версия>\\bin\\1cv8.exe, в Linux — "
+            "/opt/1cv8/x86_64/<версия>/1cv8 (без .exe, имя чувствительно к регистру). "
             "Для герметичного прогона используйте --backend fixture."
         )
     access = build_storage_access(
@@ -79,7 +86,7 @@ def _build_backend(args) -> object:
     # родитель рабочего каталога — сам репозиторий, и выгрузка конфигуратора оказалась бы
     # внутри чужого рабочего дерева (untracked-мусор для соседних источников).
     repo_root = discover_repo_root(args.workdir)
-    temp_root = Path(args.temp_root or (repo_root.parent / ".gitsync-tmp"))
+    temp_root = Path(args.temp_root or default_scratch_root(repo_root.parent / ".gitsync-tmp"))
     reject_temp_inside_repo(temp_root, repo_root)
     temp_root = temp_root / f"native-{uuid.uuid4().hex}"
     runner = DesignerRunner(
@@ -88,8 +95,11 @@ def _build_backend(args) -> object:
         version=args.v8_version or "",
         timeout=args.designer_timeout,
     )
+    # Каталог `native-<uuid>` создаёт и снимает сам бэкенд: он одноразовый и принадлежит
+    # этому запуску, в отличие от общего родителя, указанного оператором.
     return NativeStorageBackend(
-        access=access, runner=runner, temp_root=temp_root, extension=args.extension
+        access=access, runner=runner, temp_root=temp_root, extension=args.extension,
+        owns_temp_root=True,
     )
 
 
@@ -147,11 +157,16 @@ def _cmd_sync(args) -> int:
     if result.committed:
         print(f"Зафиксировано версий: {len(result.committed)} "
               f"({result.committed[0]}..{result.committed[-1]})")
-    else:
+    elif result.error is None:
+        # «Новых версий нет» — утверждение о ХРАНИЛИЩЕ, и после отказа его сделать нельзя:
+        # прогон, упавший на отчёте (например, платформа не нашла лицензию), про версии
+        # не узнал ничего. Печатать это рядом с ошибкой значит противоречить самому себе.
         print("Новых версий нет")
+    else:
+        print("Версии не синхронизированы: прогон завершился ошибкой")
     if result.cancelled:
         print("Синхронизация остановлена по запросу отмены")
-        return 130
+        return EXIT_CANCELLED
     if result.error is not None:
         # Отказ подготовки (занятая цель, грязная копия, маркер) не привязан к версии:
         # «Ошибка на версии None» сбивала бы с толку.
@@ -206,21 +221,34 @@ def _resolve_subtree(repository: str, subtree: object, position: int) -> str:
 
 def _reject_overlapping_workdirs(entries: list[dict]) -> None:
     """Перекрытие рабочих каталогов = молчаливое уничтожение соседнего источника."""
-    seen: list[tuple[str, str]] = []
+    seen: list[tuple[str, str, str]] = []
     for entry in entries:
-        key = os.path.normcase(os.path.normpath(str(Path(entry["workdir"]).absolute())))
-        for other_key, other_name in seen:
-            if key == other_key:
+        path = os.path.normpath(str(Path(entry["workdir"]).absolute()))
+        # Сравнение без учёта регистра — как на NTFS и на подключённом томе Windows.
+        # На ext4 «Расширение» и «расширение» это два каталога, а на машине разработчика
+        # они схлопнутся в один: историю такого репозитория нельзя развернуть везде.
+        folded = path.lower()
+        for other_path, other_folded, other_name in seen:
+            if path == other_path:
                 raise ConfigError(
                     f"Хранилища <{other_name}> и <{entry['name']}> используют один каталог "
                     f"<{entry['workdir']}>: у каждого источника должен быть свой подкаталог."
                 )
-            if key.startswith(other_key + os.sep) or other_key.startswith(key + os.sep):
+            if folded == other_folded:
+                raise ConfigError(
+                    f"Каталоги хранилищ <{other_name}> и <{entry['name']}> различаются только "
+                    f"регистром букв (<{entry['workdir']}>). В Linux это разные каталоги, а в "
+                    "Windows и на подключённом томе Windows — один и тот же: рабочая копия "
+                    "такого репозитория соберётся не на всякой машине. Дайте источникам "
+                    "подкаталоги с разными именами, а не с разным регистром."
+                )
+            if (folded.startswith(other_folded + os.sep)
+                    or other_folded.startswith(folded + os.sep)):
                 raise ConfigError(
                     f"Каталоги хранилищ <{other_name}> и <{entry['name']}> вложены друг в друга "
                     f"(<{entry['workdir']}>): источники должны лежать в непересекающихся подкаталогах."
                 )
-        seen.append((key, entry["name"]))
+        seen.append((path, folded, entry["name"]))
 
 
 def _validate_batch_config(config: object) -> list[dict]:
@@ -285,7 +313,10 @@ def _validate_batch_config(config: object) -> list[dict]:
 
 def _cmd_sync_all(args) -> int:
     try:
-        config = json.loads(Path(args.config).read_text(encoding="utf-8"))
+        # utf-8-sig, а не utf-8: Windows PowerShell 5.1 (Set-Content/Out-File) пишет UTF-8
+        # с BOM, и такой манифест часто переносят на Linux/в контейнер как есть. Без BOM
+        # кодек работает как обычный utf-8.
+        config = json.loads(Path(args.config).read_text(encoding="utf-8-sig"))
     except ValueError as exc:
         raise ConfigError(f"Файл <{args.config}> не является корректным JSON: {exc}") from exc
     entries = _validate_batch_config(config)
@@ -302,6 +333,7 @@ def _cmd_sync_all(args) -> int:
         entries = selected
     failures: list[str] = []
     executed = 0
+    cancelled = False
     for merged in entries:
         name = merged["name"]
         if merged.get("disable") or merged.get("disabled"):
@@ -339,6 +371,14 @@ def _cmd_sync_all(args) -> int:
             if merged.get("init"):
                 _cmd_init(sub)
             code = _cmd_sync(sub)
+            if code == EXIT_CANCELLED:
+                # Остановку запросил оператор (SIGTERM от `docker stop`, Ctrl+C).
+                # Запускать следующее хранилище после этого нельзя: его попросили
+                # остановиться, а не «пропустить одно и продолжить».
+                cancelled = True
+                print(f"Остановлено оператором на хранилище <{name}>; "
+                      "следующие хранилища не запускались", file=sys.stderr)
+                break
             if code != 0:
                 failures.append(str(name))
         except (GitSyncError, OSError) as exc:
@@ -346,8 +386,11 @@ def _cmd_sync_all(args) -> int:
             print(f"Хранилище <{name}>: ошибка {exc}", file=sys.stderr)
             failures.append(str(name))
     if failures:
+        # Настоящий сбой важнее остановки: планировщик должен увидеть именно его.
         print(f"Неуспешные хранилища: {', '.join(failures)}", file=sys.stderr)
         return 1
+    if cancelled:
+        return EXIT_CANCELLED
     if not executed:
         print("Не выполнено ни одного хранилища: все записи отключены или отфильтрованы")
     return 0
@@ -373,7 +416,9 @@ def _add_common(parser: argparse.ArgumentParser, with_storage: bool = True) -> N
         parser.add_argument("--storage-password-env", help="имя переменной окружения с паролем")
         parser.add_argument("--storage-password-file", help="файл с паролем хранилища")
         parser.add_argument("--storage-password", help=argparse.SUPPRESS)
-        parser.add_argument("--v8-path", help="полный путь к исполняемому файлу 1С (1cv8.exe)")
+        parser.add_argument("--v8-path",
+                            help="полный путь к конфигуратору 1С: Windows — 1cv8.exe, "
+                                 "Linux — /opt/1cv8/x86_64/<версия>/1cv8")
         parser.add_argument("--v8-version", help="версия платформы 1С")
         parser.add_argument("--extension", help="имя расширения для выгрузки (или -AllExtensions)")
         parser.add_argument("--designer-timeout", type=float, default=DEFAULT_DESIGNER_TIMEOUT,

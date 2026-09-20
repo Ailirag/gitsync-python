@@ -15,10 +15,37 @@ import re
 import subprocess
 from pathlib import Path
 
-from .errors import DirtyWorkingCopyError, GitSyncError
+from .errors import ConfigError, DirtyWorkingCopyError, GitSyncError
 from .safepath import reject_linked_path
 
 log = logging.getLogger("gitsync.git")
+
+#: Git печатает это, когда каталог принадлежит другому пользователю ОС. Вывод
+#: машинно-читаемый: ``run`` фиксирует ``LC_ALL=C``.
+_DUBIOUS_OWNERSHIP = "dubious ownership"
+
+
+def reject_dubious_ownership(result: subprocess.CompletedProcess[str], path: Path) -> None:
+    """Отказ Git по владельцу каталога — стоп, а не «репозитория здесь нет».
+
+    Молчаливая деградация опаснее ошибки: вызывающий код решил бы, что общего
+    репозитория не существует, и создал бы ВЛОЖЕННЫЙ ``.git`` внутри чужой рабочей
+    копии. Типичная причина — bind-монтирование, владелец которого не совпадает с
+    UID процесса в контейнере.
+    """
+    if result.returncode == 0 or _DUBIOUS_OWNERSHIP not in (result.stderr or "").lower():
+        return
+    raise ConfigError(
+        f"Git отказался работать с каталогом <{path}>: у каталога другой владелец "
+        "(обычно так выглядит подключённый том, созданный другим пользователем).\n"
+        "Сделайте одно из двух:\n"
+        f"  1) на хосте назначить каталогу владельца, под чьим UID идёт запуск "
+        f"(chown -R <UID>:<GID> <каталог>);\n"
+        f"  2) если владелец каталога доверенный — разрешить ИМЕННО этот путь: "
+        f"git config --global --add safe.directory {path}\n"
+        "Разрешение вида safe.directory со звёздочкой означает «доверять любому каталогу» "
+        "и здесь не используется."
+    )
 
 _SIGNATURE_RE = re.compile(r"^\s*(?P<name>.*?)\s*<(?P<email>[^>]*)>\s*$")
 DEFAULT_GIT_TIMEOUT = 600.0
@@ -83,7 +110,9 @@ class GitRepo:
     def is_repository(self) -> bool:
         if not (self.path / ".git").exists():
             return False
-        return self.run(["rev-parse", "--is-inside-work-tree"], check=False).returncode == 0
+        result = self.run(["rev-parse", "--is-inside-work-tree"], check=False)
+        reject_dubious_ownership(result, self.path)
+        return result.returncode == 0
 
     def init(self, initial_branch: str = "main") -> None:
         self.path.mkdir(parents=True, exist_ok=True)

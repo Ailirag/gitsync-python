@@ -1,0 +1,187 @@
+# syntax=docker/dockerfile:1
+#
+# ПРИВАТНЫЙ образ: ядро gitsync-py + толстый клиент 1С:Предприятие для Linux.
+#
+# ================== ЧТО ЗДЕСЬ ПРОВЕРЕНО, А ЧТО НЕТ ==========================
+# Файл приведён в соответствие с НАСТОЯЩИМ комплектом 8.3.27.2130 для x86_64
+# (`setup-full-8.3.27.2130-x86_64.run` из server64_8_3_27_2130.zip). Проверено
+# запуском на Debian 12 (bookworm), ядро WSL2, Docker 29.1.3:
+#   * ключи установщика сняты с его же `--help` (BitRock InstallBuilder);
+#   * состав компонентов взят из списка `--enable-components` этого комплекта;
+#   * перечень системных библиотек получен `ldd` НА УСТАНОВЛЕННОМ `1cv8`,
+#     а не из документации;
+#   * необходимость Xvfb проверена запуском конфигуратора без DISPLAY и с ним.
+#
+# ЛИЦЕНЗИРОВАНИЕ — **НЕ ПРОВЕРЕНО** и в этом образе не решается. Образ собран,
+# платформа установлена и стартует (`CREATEINFOBASE` проходит), но первое же
+# обращение к хранилищу конфигурации завершается штатным отказом платформы:
+#   «Не найдена лицензия. Не обнаружен ключ защиты программы или полученная
+#    программная лицензия!» (код возврата 1)
+# Это не дефект образа и не то, что чинится Dockerfile'ом: контейнеру нужна
+# ДЕЙСТВУЮЩАЯ лицензия 1С для Linux, полученная законным путём. Как её выдать
+# контейнеру — решение владельца лицензии, см. docs/docker-guide.md.
+# ============================================================================
+#
+# Дистрибутив 1С НЕ попадает ни в контекст сборки, ни в слои образа: он
+# подключается отдельным именованным контекстом только на время установки
+# (`RUN --mount=type=bind,from=onec`). Поэтому сборка требует BuildKit/buildx.
+#
+#   docker buildx build -f docker/Dockerfile.native \
+#       --build-context onec=/srv/private/onec-8.3.27.2130 \
+#       --build-arg ONEC_VERSION=8.3.27.2130 \
+#       --build-arg CORE_IMAGE=gitsync-py:core \
+#       -t gitsync-py:native-8.3.27.2130 --load .
+#
+# Каталог, передаваемый как `onec`, должен содержать ТОЛЬКО файлы вашего
+# легально полученного комплекта одной версии — ничего из общей папки загрузок.
+# Готовый образ НЕ публикуется: в нём проприетарные файлы.
+
+ARG CORE_IMAGE=gitsync-py:core
+FROM ${CORE_IMAGE} AS native
+
+ARG ONEC_VERSION
+# Имя файла установщика в каталоге `onec`. Вынесено в аргумент, чтобы в рецепте
+# не было подстановки по маске: маска молча возьмёт «какой-нибудь» файл, если в
+# каталог попадёт второй комплект.
+ARG ONEC_SETUP=setup-full-8.3.27.2130-x86_64.run
+# Языки интерфейса платформы. `en` НЕ является компонентом: английский входит
+# в поставку всегда, и передача `en` — это ошибка установщика (проверено).
+ARG ONEC_LANGS=ru
+USER root
+
+# --- 1. Системные зависимости платформы --------------------------------------
+# Список получен `ldd /opt/1cv8/x86_64/8.3.27.2130/1cv8` на чистом bookworm.
+# Толстый клиент 8.3.27 собран на wxWidgets/GTK3 и тянет WebKitGTK **4.0**
+# (не 4.1): именно `libwebkit2gtk-4.0-37` и `libjavascriptcoregtk-4.0-18`,
+# а с ними libsoup 2.4. В Debian 12 они есть; в Debian 13/Ubuntu 24.04 — уже нет,
+# поэтому база образа закреплена на bookworm (docker/Dockerfile.core).
+#
+# Что именно не находил `ldd` до установки этих пакетов:
+#   libgtk-3, libgdk-3, libatk-1.0, libcairo, libcairo-gobject, libgdk_pixbuf-2.0,
+#   libpango-1.0, libpangocairo-1.0, libglib-2.0, libgobject-2.0, libgio-2.0,
+#   libgthread-2.0, libwebkit2gtk-4.0, libjavascriptcoregtk-4.0, libsoup-2.4,
+#   libcups, libX11, libSM, libXxf86vm, libGL, libGLU.
+# Библиотеки libicu/libtcmalloc/libunwind/libwx платформа приносит свои.
+#
+# fontconfig + шрифты: отчёт по версиям хранилища — табличный документ, его
+# формирование обращается к подсистеме шрифтов.
+#
+# iproute2 — не косметика: платформа перечисляет сетевые интерфейсы через
+# `/bin/sh -c /sbin/ip ...`. Без пакета в stderr каждого запуска конфигуратора
+# идёт «/bin/sh: 1: /sbin/ip: not found», и этот мусор попадает в диагностику
+# синхронизации. Наблюдалось на этом комплекте.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        libgtk-3-0 \
+        libwebkit2gtk-4.0-37 \
+        libjavascriptcoregtk-4.0-18 \
+        libsoup2.4-1 \
+        libcups2 \
+        libgl1 \
+        libglu1-mesa \
+        libsm6 \
+        libx11-6 \
+        libxxf86vm1 \
+        libgomp1 \
+        fontconfig \
+        fonts-dejavu-core \
+        iproute2 \
+        locales; \
+    rm -rf /var/lib/apt/lists/*
+
+# --- 2. Установка платформы из приватного комплекта ---------------------------
+# Комплект монтируется только на время RUN: в слой образа он не попадает.
+# Ключи и имена компонентов — из `--help` этого самого установщика:
+#
+#   --mode unattended --unattendedmodeui none   тихая установка без X
+#   --enable-components  client_full,<языки>    толстый клиент + конфигуратор
+#   --disable-components ...                    всё остальное явным списком
+#
+# client_full — это ИМЕННО толстый клиент с конфигуратором. Тонкий клиент
+# (`client_thin`) разработку конфигураций не поддерживает и здесь бесполезен.
+# `v8_install_deps` отключён намеренно: зависимости уже поставлены выше
+# конкретными пакетами, а этот компонент ставит их сам и по своему списку.
+# `server`, `ws`, `server_admin`, `config_storage_server` не нужны: инструмент
+# читает файловое хранилище клиентом. `liberica_jre`, `integrity_monitoring`,
+# `desktop_icons` — лишний вес в образе без интерактивного сеанса.
+#
+# Установщик запускается ПРЯМО с bind-монтирования (файл в каталоге комплекта
+# должен быть исполняемым). Копия в /tmp не делается сознательно: это 1.7 ГБ
+# записи в слой сборки ради ничего.
+RUN --mount=type=bind,from=onec,source=.,target=/run/onec,ro \
+    set -eux; \
+    test -n "${ONEC_VERSION}" || { echo "задайте --build-arg ONEC_VERSION=<версия>"; exit 2; }; \
+    test -x "/run/onec/${ONEC_SETUP}" || { \
+        echo "в каталоге комплекта нет исполняемого ${ONEC_SETUP}:"; ls -l /run/onec; \
+        echo "сделайте файл исполняемым (chmod +x) в приватном каталоге комплекта"; exit 2; }; \
+    "/run/onec/${ONEC_SETUP}" --version; \
+    "/run/onec/${ONEC_SETUP}" \
+        --mode unattended --unattendedmodeui none \
+        --enable-components "client_full,${ONEC_LANGS}" \
+        --disable-components client_thin,client_thin_fib,v8_install_deps,desktop_icons,server,ws,server_admin,config_storage_server,additional_admin_functions,liberica_jre,integrity_monitoring,az,ar,hy,bg,hu,el,vi,ka,kk,zh,it,es,lv,lt,de,pl,pt_BR,ro,tr,tk,fr,uk
+
+# --- 3. Проверка того, что действительно установилось -------------------------
+# Сборка обязана падать здесь, а не в середине первой синхронизации.
+RUN set -eux; \
+    V8="/opt/1cv8/x86_64/${ONEC_VERSION}/1cv8"; \
+    test -x "$V8" || { echo "не найден исполняемый файл конфигуратора: $V8"; ls -R /opt/1cv8 || true; exit 2; }; \
+    echo "--- ldd (не должно быть 'not found') ---"; \
+    missing="$(ldd "$V8" 2>&1 | grep -i 'not found' | sort -u || true)"; \
+    if [ -n "$missing" ]; then echo "$missing"; echo 'нет обязательных библиотек'; exit 2; fi
+
+# --- 4. Графическое окружение --------------------------------------------------
+# ПРОВЕРЕНО на этом комплекте: без DISPLAY конфигуратор не запускается вообще —
+# `CREATEINFOBASE` завершается с кодом 255 и сообщением «Unable to initialize
+# GTK+ or connect to the windowing system. Is DISPLAY set properly?». Под Xvfb
+# та же команда даёт код 0 и настоящую файловую базу. `/DisableStartupDialogs`
+# убирает диалоги, но зависимость от X не снимает. Значит, Xvfb обязателен.
+# Это одноразовый X-сервер ВНУТРИ контейнера; сокет X с хоста не пробрасывается.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends xvfb xauth; \
+    rm -rf /var/lib/apt/lists/*
+
+COPY docker/xvfb-entrypoint.sh /usr/local/bin/gitsync-xvfb-entrypoint
+COPY docker/onec-user-entrypoint.sh /usr/local/bin/gitsync-onec-user-entrypoint
+RUN chmod 0755 /usr/local/bin/gitsync-xvfb-entrypoint /usr/local/bin/gitsync-onec-user-entrypoint
+
+ENV GITSYNC_V8_PATH=/opt/1cv8/x86_64/${ONEC_VERSION}/1cv8
+
+# Каталог настроек платформы. 1С пишет туда служебные файлы; при произвольном UID
+# без записи в /etc/passwd HOME берётся из окружения, и каталог обязан быть
+# доступен на запись — иначе конфигуратор падает не по делу.
+RUN set -eux; \
+    mkdir -p /home/app/.1cv8/1C/1cv8; \
+    chown -R app:0 /home/app/.1cv8; \
+    chmod -R g=u /home/app/.1cv8
+
+# --- 5. Учётная запись для произвольного UID -----------------------------------
+# ПРОВЕРЕНО на 8.3.27.2130: если текущего UID нет в /etc/passwd, `1cv8` завершается
+# по SIGSEGV (код 139) ещё до создания файловой базы — ни сообщения, ни файла /Out.
+# С записью о том же UID та же команда отрабатывает с кодом 0. Ядро образа заявлено
+# пригодным для запуска с произвольным UID (`--user 12345:0`), поэтому право дозаписи
+# даётся ГРУППЕ 0, под которой такие контейнеры и запускают, а строку добавляет
+# docker/onec-user-entrypoint.sh на старте.
+#
+# Это не повышение прав: UID процесса задан снаружи флагом --user и от записи в файле
+# не зависит. Права владельца (root) не расширяются, пароли в файле не хранятся (/etc/shadow
+# остаётся нетронутым). Если такой доступ в вашей среде недопустим — запускайте контейнер
+# с --user 10001:0 и смонтируйте /etc/passwd только на чтение: обёртка тогда лишь предупредит.
+RUN set -eux; \
+    chgrp 0 /etc/passwd; \
+    chmod g+w /etc/passwd
+
+USER app
+WORKDIR /repo
+
+# Цепочка обёрток, каждая уступает своё место следующей через `exec`:
+#   1) личность: запись о текущем UID в /etc/passwd (без неё толстый клиент падает);
+#   2) X-сервер: свой Xvfb и DISPLAY (без X конфигуратор не стартует вовсе);
+#   3) предполётная проверка ядра и сама команда.
+# Посредников в цепочке процессов не остаётся, поэтому SIGTERM от `docker stop`
+# приходит самой синхронизации (у `xvfb-run` это не так, см. docker/xvfb-entrypoint.sh).
+ENTRYPOINT ["/usr/local/bin/gitsync-onec-user-entrypoint", \
+            "/usr/local/bin/gitsync-xvfb-entrypoint", \
+            "/usr/local/bin/gitsync-entrypoint"]
+CMD ["--help"]

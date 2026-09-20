@@ -24,6 +24,7 @@ import logging
 import os
 import shutil
 import threading
+import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
@@ -36,16 +37,26 @@ from .errors import (
     DesignerError,
     DirtyWorkingCopyError,
     ExportIncompleteError,
+    GitSyncError,
+    LicenseUnavailableError,
     LockBusyError,
     PostCommitError,
     StorageVersionMismatchError,
     UnsafePathError,
     VersionFileError,
 )
-from .gitrepo import GitRepo
+from .gitrepo import GitRepo, reject_dubious_ownership
 from .locks import exclusive_lock
 from .plugins import PluginHost
-from .safepath import safe_join
+from .safepath import (
+    Identity,
+    default_scratch_root,
+    directory_identity,
+    discard_inside_owned_directory,
+    discard_owned_directory,
+    require_private_scratch,
+    safe_join,
+)
 from .storage_report import StorageVersion
 from .transaction import blob_entry, image, index_entries, locked_index, owned_path, put_image, update_entries
 from .version_file import (
@@ -58,6 +69,12 @@ from .version_file import (
 )
 
 log = logging.getLogger("gitsync.sync")
+
+#: Названия собственных каталогов в журнале и в тексте ошибок. Каталог выгрузки снимается
+#: по СВОЕМУ удостоверению, каталог версии — как запись внутри него, но оба только после
+#: подтверждения владения, и оба обслуживаются одним списком ресурсов прогона.
+EXPORT_RUN_DIR = "Каталог выгрузки"
+EXPORT_VERSION_DIR = "Каталог версии"
 
 #: Файлы и каталоги рабочей копии, которые не удаляются при очистке (как в upstream).
 SERVICE_NAMES = frozenset(
@@ -78,6 +95,18 @@ LOCK_FILE_NAME = "gitsync-py.lock"
 
 #: Если версия в git больше версии хранилища больше чем на столько — это ошибка (upstream: 10).
 DEFAULT_MIN_VERSION_GAP = 10
+
+#: Сколько ждать перед повторным запросом лицензии, секунды.
+#:
+#: Замер, а не оценка (evidence/stage-19/14-churn1-summary.txt): на этом стенде число
+#: одновременно получаемых лицензий падало до 2 сразу после серии запусков и
+#: возвращалось к 8 после двух минут покоя. Пауза в этом порядке величин и выбрана:
+#: меньше — повтор просит ту же лицензию в ту же секунду, больше — задание стоит
+#: дольше, чем длится сама помеха. Число ограничивает ОДНУ паузу; сколько их будет,
+#: задаёт ``retries``.
+LICENSE_RETRY_PAUSE = 20.0
+#: Шаг ожидания: отмена не должна ждать конца паузы.
+LICENSE_RETRY_POLL = 0.5
 
 
 @dataclass
@@ -568,15 +597,18 @@ class SyncManager:
 
     # --- вспомогательное -------------------------------------------------
 
-    def _temp_root(self) -> Path:
-        """Собственный каталог запуска внутри переданного родителя.
+    def _temp_root(self) -> tuple[Path, Identity | None]:
+        """Собственный каталог выгрузки внутри переданного родителя и его удостоверение.
 
         Родительский каталог может быть общим (несколько репозиториев, параллельные запуски),
-        поэтому удаляется ТОЛЬКО созданный здесь ``run-<uuid>``, а не сам родитель.
+        поэтому удаляется ТОЛЬКО созданный здесь ``run-<uuid>``, а не сам родитель. Владение
+        подтверждается созданием (``exist_ok=False``), а принадлежность в момент очистки —
+        удостоверением каталога: путь к тому времени может вести уже не сюда.
         """
         # По умолчанию — рядом с корнем репозитория, а не рядом с подкаталогом выгрузки:
         # иначе временный каталог оказался бы внутри рабочей копии и попал под очистку.
-        parent = Path(self.options.temp_root or (self.repo.path.parent / ".gitsync-tmp"))
+        parent = Path(self.options.temp_root
+                      or default_scratch_root(self.repo.path.parent / ".gitsync-tmp"))
         parent_resolved = parent.resolve() if parent.exists() else parent.absolute()
         repo_resolved = self.repo.path.resolve() if self.repo.path.exists() else self.repo.path.absolute()
         if parent_resolved == repo_resolved or repo_resolved in parent_resolved.parents:
@@ -584,13 +616,24 @@ class SyncManager:
                 f"Каталог временных файлов <{parent}> находится внутри рабочей копии "
                 f"<{self.repo.path}>: очистка рабочей копии уничтожила бы выгрузку"
             )
+        # Договор контейнерной поставки: каталог запуска обязан быть частным. Отказ
+        # происходит ЗДЕСЬ — до создания родителя и до любой уборки (stage-18).
+        require_private_scratch(parent, "Корень временных каталогов")
         parent.mkdir(parents=True, exist_ok=True)
         run_root = parent / f"run-{uuid.uuid4().hex}"
         run_root.mkdir(exist_ok=False)
-        return run_root
+        return run_root, directory_identity(run_root)
 
-    def _export_one(self, version: StorageVersion, temp_root: Path, cancel: threading.Event) -> Path:
-        """Выгружает одну версию в собственный каталог. Повторяет попытки при временных сбоях."""
+    def _export_one(self, version: StorageVersion, temp_root: Path, temp_identity: Identity | None,
+                    cancel: threading.Event) -> Path:
+        """Выгружает одну версию в собственный каталог. Повторяет попытки при временных сбоях.
+
+        Каталог версии создаёт бэкенд или плагин (``before_export`` вправе взять выгрузку на
+        себя — docs/plugins.md), поэтому своего удостоверения у него нет. Снимается он не по
+        пути, а как ЗАПИСЬ внутри каталога выгрузки, удостоверение которого снято при
+        создании: закреплённый родитель делает путь неподменяемым, и подмена предка уже не
+        уводит рекурсивное удаление в чужое дерево.
+        """
         attempts = max(self.options.retries, 0) + 1
         last_error: BaseException | None = None
         for attempt in range(1, attempts + 1):
@@ -606,19 +649,55 @@ class SyncManager:
                 self._verify_export(version, dest)
                 validate_export_tree(dest)
                 return dest
+            except LicenseUnavailableError as exc:
+                # ОТДЕЛЬНАЯ ветка и обязательно ВЫШЕ DesignerError: это его наследник.
+                # Лицензию на запуск не выдали — работа не начиналась, хранилище не
+                # читалось, повторять безопасно. Именно для этого оператор и задаёт
+                # retries; до stage-19 настройка к этому отказу не применялась вовсе,
+                # и одна несостоявшаяся выдача стоила всех оставшихся версий.
+                last_error = exc
+                self._discard_version_dir(temp_root, temp_identity, dest)
+                log.warning("Версия %s: лицензия не выдана (попытка %s из %s): %s",
+                            version.number, attempt, attempts, exc)
+                if attempt < attempts:
+                    self._wait_for_license(cancel)
             except (CancelledError, UnsafePathError, DesignerError):
                 # Native errors are not classified transient: never blindly retry
                 # invalid authentication, same-login contention or a Designer timeout.
-                shutil.rmtree(dest, ignore_errors=True)
+                self._discard_version_dir(temp_root, temp_identity, dest)
                 raise
             except BaseException as exc:  # noqa: BLE001 — решение о повторе принимаем ниже
                 last_error = exc
-                shutil.rmtree(dest, ignore_errors=True)
+                self._discard_version_dir(temp_root, temp_identity, dest)
                 log.warning(
                     "Версия %s: попытка %s из %s не удалась: %s", version.number, attempt, attempts, exc
                 )
         assert last_error is not None
         raise last_error
+
+    def _wait_for_license(self, cancel: threading.Event) -> None:
+        """Пауза перед повторным запросом лицензии. Отмену ждать не заставляет.
+
+        Величина взята из ЗАМЕРА, а не из общих соображений (evidence/stage-19):
+        число одновременно получаемых лицензий на стенде менялось в пределах минут,
+        и после серии запусков возвращалось к прежнему за десятки секунд. Мгновенный
+        повтор просил бы ту же лицензию в ту же секунду и почти всегда получал бы тот
+        же отказ, зато добавлял бы ещё один сеанс к очереди.
+
+        Это НЕ устранение причины: причина снаружи, в доступности лицензий. Это отказ
+        терять уже сделанную работу из-за события, которое проходит само.
+        """
+        deadline = time.monotonic() + LICENSE_RETRY_PAUSE
+        while time.monotonic() < deadline:
+            if cancel.is_set():
+                raise CancelledError("Ожидание лицензии прервано")
+            time.sleep(LICENSE_RETRY_POLL)
+
+    def _discard_version_dir(self, temp_root: Path, temp_identity: Identity | None,
+                             dest: Path) -> bool:
+        """Снимает каталог версии как запись внутри СВОЕГО каталога выгрузки."""
+        return discard_inside_owned_directory(temp_root, temp_identity, dest.name,
+                                              EXPORT_VERSION_DIR)
 
     def _verify_export(self, version: StorageVersion, dest: Path) -> None:
         """Выгрузка считается состоявшейся только по факту артефакта, а не по отсутствию ошибки.
@@ -773,8 +852,11 @@ class SyncManager:
         self.sync_dir.mkdir(parents=True, exist_ok=True)
 
         lock_path = self._git_dir() / LOCK_FILE_NAME
-        with (exclusive_lock(lock_path, timeout=self.options.lock_timeout),
-              self._run_resources(result) as run_dirs):
+        # Очистка объявляется ПЕРЕД блокировкой цели: к моменту отказа по занятой цели
+        # свои каталоги уже могли появиться (бэкенд создаёт их при первой работе), и
+        # занятая цель не повод оставить их на томе.
+        with (self._run_resources(result) as run_dirs,
+              exclusive_lock(lock_path, timeout=self.options.lock_timeout)):
             self._check_source_isolation()
             # Незавершённая транзакция прошлого запуска снимается ДО проверки грязной копии:
             # иначе собственные недописанные файлы выглядят как чужие правки.
@@ -814,8 +896,8 @@ class SyncManager:
 
             self._baseline = self._target_state()
             authors = read_authors_file(self.sync_dir / AUTHORS_FILE_NAME)
-            temp_root = self._temp_root()
-            run_dirs.append(temp_root)
+            temp_root, temp_identity = self._temp_root()
+            run_dirs.append((self._discard_run_dir, (temp_root, temp_identity)))
             window = max(self.options.jobs, 1) + max(self.options.queue_limit, 0)
 
             futures: dict[int, Future[Path]] = {}
@@ -828,7 +910,7 @@ class SyncManager:
                         while submitted < len(pending) and submitted - position < window:
                             candidate = pending[submitted]
                             futures[candidate.number] = pool.submit(
-                                self._export_one, candidate, temp_root, cancel
+                                self._export_one, candidate, temp_root, temp_identity, cancel
                             )
                             submitted += 1
                             result.max_inflight = max(result.max_inflight, submitted - position)
@@ -873,8 +955,13 @@ class SyncManager:
                                     self._journal().clear()
                             break
                         finally:
-                            if self.options.cleanup_temp:
-                                shutil.rmtree(export_dir, ignore_errors=True)
+                            if self.options.cleanup_temp and not self._discard_version_dir(
+                                    temp_root, temp_identity, export_dir):
+                                # Отказ не гасится: оставшийся каталог обязан быть виден
+                                # вызывающему. Снятие корня выгрузки унесёт его с собой —
+                                # проверка ниже поднимет тревогу, только если не унесло.
+                                run_dirs.append((self._require_discarded,
+                                                 (export_dir, EXPORT_VERSION_DIR)))
 
                         result.committed.append(version.number)
                         self._baseline = self._target_state()
@@ -911,6 +998,25 @@ class SyncManager:
                     result.post_commit = bool(result.committed)
                     raise
 
+    def _require_discarded(self, path: Path, what: str) -> None:
+        """Оставшийся собственный каталог — ошибка результата, а не строка в журнале."""
+        if os.path.lexists(path):
+            raise GitSyncError(f"{what} снять не удалось: {path}")
+
+    def _discard_run_dir(self, root: Path, identity: Identity | None,
+                         what: str = EXPORT_RUN_DIR) -> None:
+        """Снимает собственный каталог выгрузки — тот, который прогон сам и создал.
+
+        Удаление идёт по удостоверению каталога, а не по пути: подмена родителя между
+        работой и очисткой увела бы рекурсивное удаление в чужое дерево (та же граница,
+        что у каталога запуска бэкенда, — docs/plugins.md). Несостоявшаяся очистка
+        остаётся ошибкой результата, как и раньше при отказе ``rmtree``: оставленный
+        каталог обязан быть виден вызывающему, а не только в журнале. Тем же путём
+        уходит и каталог ВЕРСИИ, снять который в своё время не удалось.
+        """
+        if not discard_owned_directory(root, identity, what):
+            raise GitSyncError(f"{what} снять не удалось: {root}")
+
     @contextmanager
     def _run_resources(self, result: SyncResult):
         """Owned run/backend cleanup after pool shutdown, even on callback failure."""
@@ -923,7 +1029,10 @@ class SyncManager:
             raise
         finally:
             if self.options.cleanup_temp:
-                actions = [(shutil.rmtree, (root,)) for root in run_dirs]
+                # Порядок — как складывали: сначала каталог выгрузки, потом проверки
+                # каталогов версий, снять которые в своё время не удалось. Снятый корень
+                # уносит их с собой, и проверка молча подтверждает цель.
+                actions = list(run_dirs)
                 cleanup = getattr(self.backend, "cleanup", None)
                 if callable(cleanup):
                     actions.append((cleanup, ()))
@@ -943,7 +1052,14 @@ class SyncManager:
     def init_working_copy(self, generate_authors: bool = True, *, raise_on_error: bool = False) -> bool:
         """Returns False on lock contention, or raises when explicitly requested."""
         try:
-            with exclusive_lock(resolve_lock_path(self.work_dir), timeout=self.options.lock_timeout):
+            # Init создаёт настоящий бэкенд с временной ИБ (AUTHORS берётся из отчёта
+            # хранилища), поэтому отпускает ресурсы тот же защищённый finally, что и sync.
+            # Ресурсы снимаются и при занятой цели: каталог запуска мог быть создан
+            # первой же работой бэкенда, и очистка не должна зависеть от того, дошло
+            # ли дело до захвата блокировки.
+            with (self._run_resources(SyncResult()),
+                  exclusive_lock(resolve_lock_path(self.work_dir),
+                                 timeout=self.options.lock_timeout)):
                 self.sync_dir = self._resolve_sync_dir()
                 self.repo.init()
                 self._check_source_isolation()
@@ -1062,6 +1178,7 @@ def discover_repo_root(work_dir: str | Path) -> Path:
             return path
         probe = parent
     result = GitRepo(probe).run(["rev-parse", "--show-toplevel"], check=False)
+    reject_dubious_ownership(result, probe)
     if result.returncode == 0 and result.stdout.strip():
         root = Path(result.stdout.strip())
         if root.exists():

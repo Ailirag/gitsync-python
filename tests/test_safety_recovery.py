@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+import gitsync
 from gitsync.backends import FakeStorageBackend
 from gitsync.cli import build_parser, main
 from gitsync.designer import DesignerRunner
@@ -36,7 +37,10 @@ from gitsync.storage_report import StorageVersion
 from gitsync.sync import LOCK_FILE_NAME, SyncManager, SyncOptions
 from gitsync.version_file import read_version_file, write_version_file
 
-SRC = Path(__file__).resolve().parents[1] / "src"
+#: Каталог, из которого импортируется ПРОВЕРЯЕМЫЙ пакет: дочерние процессы обязаны
+#: брать тот же код, что и тест. Вычисляется по самому модулю, а не по раскладке
+#: дерева: при установке колеса (в том числе в контейнере) исходников рядом нет.
+SRC = Path(gitsync.__file__).resolve().parent.parent
 FIXTURE = Path(__file__).resolve().parents[1] / "examples" / "fixture-storage"
 
 

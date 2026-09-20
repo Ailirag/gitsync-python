@@ -1,0 +1,140 @@
+# syntax=docker/dockerfile:1
+#
+# gitsync-py: публичный образ ЯДРА — Python + Git + сам инструмент.
+# Платформы 1С:Предприятие здесь НЕТ и быть не может: её дистрибутив несвободен.
+# Этот образ умеет всё, кроме обращения к настоящему хранилищу конфигурации:
+#   * герметичные прогоны (--backend fixture),
+#   * работу с репозиторием Git (включая отдельную отправку),
+#   * служить основанием для приватного образа с платформой (docker/Dockerfile.native).
+#
+# Сборка:
+#   docker build -f docker/Dockerfile.core --target core -t gitsync-py:core .
+# Тестовая цель (в неё дополнительно попадают тесты и pytest):
+#   docker build -f docker/Dockerfile.core --target test -t gitsync-py:test .
+#
+# Файл намеренно собирается и новым сборщиком (BuildKit/buildx), и старым:
+# в нём нет конструкций, доступных только BuildKit. Приватный образ с платформой
+# (docker/Dockerfile.native) — наоборот, требует BuildKit, потому что дистрибутив
+# 1С подключается туда bind-монтированием и не должен попадать в слои.
+
+# Базовый образ закреплён по digest: тег bookworm со временем переезжает на новую
+# сборку, и без digest история сборок не воспроизводится. Этот digest — тот самый,
+# на котором собран и проверен образ (Python 3.11.16, Debian 12, git 2.39.5).
+# Обновление базы — осознанное действие: новый digest подставляют и перепроверяют.
+#   docker build --build-arg BASE_IMAGE=python:3.11-slim-bookworm@sha256:<новый> ...
+ARG BASE_IMAGE=python:3.11-slim-bookworm@sha256:528257d48c1da0dcecc2e725d1ae34498d60c965f1241e39cd6a85a8859bdf84
+
+# ---------------------------------------------------------------- сборка колеса
+FROM ${BASE_IMAGE} AS build
+WORKDIR /build
+# Метаданные пакета отдельным слоем: они меняются реже исходников.
+COPY pyproject.toml README.md LICENSE NOTICE.md ./
+COPY src ./src
+COPY docker/provenance.py ./provenance.py
+# --no-deps: у пакета нет зависимостей времени выполнения (см. pyproject.toml).
+# Провенанс печатается отдельным шагом: в журнал сборки уходят sha256 колеса и
+# загрузочного расширения, по ним приёмка сверяет содержимое готового образа.
+RUN python -m pip install --no-cache-dir --upgrade pip \
+    && python -m pip wheel --no-deps --wheel-dir /wheels . \
+    && python provenance.py
+
+# ------------------------------------------------------------- образ выполнения
+FROM ${BASE_IMAGE} AS core
+
+# UID/GID по умолчанию. Их ОБЯЗАН совпадать у всех контейнеров, которые делят
+# том блокировок сессий хранилища: файл блокировки создаётся с правами 0600.
+ARG APP_UID=10001
+ARG APP_GID=10001
+
+# git — единственная внешняя программа, которая нужна ядру.
+# openssh-client — для адресов вида ssh://git@… и git@host:путь: без него отправка
+# в Git по ssh падает с «ssh: not found» ещё до подключения, а именно так настроена
+# служба push в docker/compose.yaml.
+# ca-certificates — для https-адресов Git, tzdata — чтобы TZ работала,
+# locales уже не нужен: используется встроенная C.UTF-8.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        git \
+        openssh-client \
+        ca-certificates \
+        tzdata; \
+    rm -rf /var/lib/apt/lists/*; \
+    getent group "${APP_GID}" >/dev/null || groupadd --gid "${APP_GID}" app; \
+    useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home --shell /usr/sbin/nologin app
+
+COPY --from=build /wheels /wheels
+RUN python -m pip install --no-cache-dir /wheels/*.whl && rm -rf /wheels
+
+COPY docker/entrypoint.sh /usr/local/bin/gitsync-entrypoint
+RUN chmod 0755 /usr/local/bin/gitsync-entrypoint
+
+# Каталоги с ФИКСИРОВАННЫМИ путями внутри контейнера. Пути одинаковы у всех
+# контейнеров осознанно: канонический путь хранилища входит в ключ блокировки
+# сессии, и разные точки монтирования одного хранилища не сводятся друг к другу.
+#
+#   /repo                     — рабочая копия Git (общий репозиторий базы)
+#   /config                   — манифест и прочие настройки, только чтение
+#   /work/tmp                 — прочие временные файлы задания
+#   /var/lib/gitsync/scratch  — КАТАЛОГ ЗАПУСКА (выгрузка конфигуратора)
+#   /var/lib/gitsync/sessions — ОБЩИЙ том блокировок входа в хранилище
+#   /storage                  — файловое хранилище, если оно подключается файлами
+#
+# Владелец app:0 и g=u — чтобы контейнер, запущенный с произвольным UID и GID 0
+# (`--user 12345:0`), мог писать в HOME и в каталог блокировок.
+#
+# ПОЧЕМУ КАТАЛОГ ЗАПУСКА ОТДЕЛЬНЫЙ И НЕ МОНТИРУЕТСЯ (stage-18). Выгрузка версии — это
+# данные задания. Замерено на стенде: если каталог запуска лежит на смонтированном томе
+# (bind-mount каталога хоста ИЛИ том docker, именованный либо анонимный), то другой
+# штатный контейнер с тем же UID 10001 видит выгрузку, читает её и уничтожает `rm -rf`
+# (evidence/stage-18: 10-isolation-probe.log, 13-volume-probe.log). На собственном слое
+# контейнера того же нападающего нет: каталога он не видит вовсе, выгрузка цела.
+# Поэтому /var/lib/gitsync/scratch — часть образа, а НЕ точка монтирования, и монтировать
+# в него нельзя: задание откажется работать до создания каталога.
+RUN set -eux; \
+    mkdir -p /repo /config /work/tmp /storage /var/lib/gitsync/sessions /var/lib/gitsync/scratch; \
+    chown -R app:0 /home/app /work /var/lib/gitsync /repo; \
+    chmod -R g=u /home/app /work /var/lib/gitsync /repo
+
+ENV HOME=/home/app \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    GITSYNC_SESSION_DIR=/var/lib/gitsync/sessions \
+    GITSYNC_SCRATCH=/var/lib/gitsync/scratch \
+    GITSYNC_REQUIRE_PRIVATE_SCRATCH=1 \
+    GITSYNC_REPO=/repo
+
+USER app
+WORKDIR /repo
+
+# exec в entrypoint: сигналы должны доходить до Python без посредника.
+ENTRYPOINT ["/usr/local/bin/gitsync-entrypoint"]
+CMD ["--help"]
+
+# -------------------------------------------------------------- цель для тестов
+# Тесты НЕ входят в образ выполнения: сюда они попадают отдельной целью.
+FROM core AS test
+USER root
+RUN python -m pip install --no-cache-dir "pytest>=8.0" "ruff>=0.6"
+# Набор тестов читает руководство и примеры как исполняемый контракт, поэтому
+# рядом с tests/ обязаны лежать docs/, examples/, README.md и pyproject.toml:
+# сами тесты вычисляют корень как tests/.. — здесь это /src.
+COPY --chown=app:0 tests /src/tests
+COPY --chown=app:0 docs /src/docs
+COPY --chown=app:0 examples /src/examples
+# Тесты сверяют руководство по Docker с самими файлами сборки: Dockerfile,
+# compose и предполётный скрипт обязаны быть рядом, иначе контракт непроверяем.
+COPY --chown=app:0 docker /src/docker
+COPY --chown=app:0 .dockerignore /src/.dockerignore
+COPY --chown=app:0 pyproject.toml README.md LICENSE NOTICE.md SCOPE.md /src/
+# Исходники нужны линтеру; пакет при этом берётся установленный, а не из /src.
+COPY --chown=app:0 src /src/src
+# Каталог /src создан операциями COPY и принадлежит root: без смены владельца
+# pytest не может создать свой кэш и засоряет вывод предупреждениями.
+RUN chown -R app:0 /src && chmod -R g=u /src
+USER app
+WORKDIR /src
+ENTRYPOINT []
+CMD ["python", "-m", "pytest", "-q"]

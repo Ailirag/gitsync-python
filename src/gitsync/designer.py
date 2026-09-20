@@ -22,18 +22,39 @@
 
 from __future__ import annotations
 
+import codecs
 import logging
 import subprocess
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from .errors import DesignerError, DesignerTimeoutError
+from .errors import DesignerError, DesignerTimeoutError, LicenseUnavailableError
 
 log = logging.getLogger("gitsync.designer")
 
 DEFAULT_DESIGNER_TIMEOUT = 3600.0
 MASK = "***"
+
+#: Чем платформа отвечает, когда лицензию на запуск получить НЕ УДАЛОСЬ.
+#:
+#: Тексты сняты со стенда (evidence/stage-19), а не составлены по документации. Их две
+#: пары — по одной на каждый язык интерфейса, и обе означают одно и то же для нас:
+#: конфигуратор не стартовал, работа не начиналась.
+#:
+#: «Не обнаружено свободной лицензии» — сервис ответил, что мест сейчас нет;
+#: «Не найдена лицензия … ключ защиты» — клиент пригодного ключа не увидел вовсе.
+#: Обе формулировки воспроизведены ОДНИМ зондом, где менялось только число
+#: одновременных конфигураторов, поэтому обе считаются отказом в выдаче.
+LICENSE_REFUSAL_MARKERS = (
+    "не обнаружено свободной лицензии",
+    "there are no free licenses",
+    "не найдена лицензия",
+    "license not found",
+)
+
+#: Сколько текста файла ``/Out`` попадает в сообщение об ошибке.
+OUT_EXCERPT_LIMIT = 2000
 
 # Ключи, значение которых нельзя показывать. Формы: "/P" + значение отдельным аргументом
 # и "/Pзначение" одним аргументом (так делает v8runner).
@@ -101,6 +122,63 @@ def redact_text(text: str, secrets: list[str]) -> str:
     for secret in sorted({item for item in secrets if item}, key=len, reverse=True):
         text = text.replace(secret, MASK)
     return text
+
+
+def is_license_refusal(reason: str) -> bool:
+    """Отказ ли это В ВЫДАЧЕ лицензии — по тексту файла ``/Out``, и только по нему.
+
+    Судить по всему сообщению об ошибке нельзя: в него входит argv, а в путях запуска
+    может оказаться что угодно. Причину платформа кладёт в ``/Out``, там и смотрим.
+    """
+    low = (reason or "").lower()
+    return any(marker in low for marker in LICENSE_REFUSAL_MARKERS)
+
+
+def out_file_from_args(args: list[str]) -> str | None:
+    """Путь, переданный конфигуратору ключом ``/Out`` (обе формы записи ключа)."""
+    for index, item in enumerate(args):
+        if item == "/Out":
+            if index + 1 < len(args):
+                return args[index + 1]
+            return None
+        if item.startswith("/Out") and len(item) > len("/Out"):
+            return item[len("/Out"):]
+    return None
+
+
+def read_designer_out(path: str | Path) -> str:
+    """Текст файла ``/Out`` — там конфигуратор пишет НАСТОЯЩУЮ причину отказа.
+
+    ПРОВЕРЕНО на 8.3.27.2130 (Linux, контейнер): при отказе в ``stderr`` уходит только
+    посторонний шум (``Fontconfig error: No writable cache directories``), а причина
+    («Не найдена лицензия…») попадает исключительно в этот файл. Без его чтения пакетный
+    прогон выглядит как «источник молча вышел с кодом 1».
+
+    Кодировка зависит от платформы: Linux — UTF-8 с BOM, Windows — UTF-16 или однобайтовая
+    кодировка системы. Определяем по BOM, дальше пробуем UTF-8 и откатываемся на cp1251;
+    файл диагностики не имеет права уронить разбор ошибки, поэтому битые байты заменяются.
+    """
+    try:
+        raw = Path(path).read_bytes()
+    except OSError:
+        return ""
+    if not raw.strip():
+        return ""
+    for bom, encoding in (
+        (codecs.BOM_UTF8, "utf-8-sig"),
+        (codecs.BOM_UTF32_LE, "utf-32"),
+        (codecs.BOM_UTF32_BE, "utf-32"),
+        (codecs.BOM_UTF16_LE, "utf-16"),
+        (codecs.BOM_UTF16_BE, "utf-16"),
+    ):
+        if raw.startswith(bom):
+            return raw.decode(encoding, errors="replace").strip()
+    for encoding in ("utf-8", "cp1251"):
+        try:
+            return raw.decode(encoding).strip()
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace").strip()
 
 
 class DesignerRunner:
@@ -267,10 +345,47 @@ class DesignerRunner:
                 f"Конфигуратор не завершился за {timeout or self.timeout:g} с: {' '.join(safe)}"
             ) from None  # цепочка исключений вернула бы незамаскированный argv/вывод
         if result.returncode != 0:
-            raise DesignerError(
+            out_path = out_file_from_args(args)
+            reason = read_designer_out(out_path) if out_path else ""
+            failure = (
+                LicenseUnavailableError if is_license_refusal(reason) else DesignerError
+            )
+            raise failure(
                 f"Конфигуратор завершился с кодом {result.returncode}: {' '.join(safe)}\n"
-                + redact_text((result.stderr or result.stdout or "").strip()[:2000], secrets)
+                + self._failure_details(args, result, secrets, reason=reason)
             )
         result.stdout = redact_text(result.stdout or "", secrets)
         result.stderr = redact_text(result.stderr or "", secrets)
         return result
+
+    def _failure_details(
+        self,
+        args: list[str],
+        result: subprocess.CompletedProcess[str],
+        secrets: list[str],
+        reason: str | None = None,
+    ) -> str:
+        """Диагностика отказа: сначала файл ``/Out``, потом вывод процесса.
+
+        Порядок не косметика. Причину отказа конфигуратор кладёт в ``/Out``, а в
+        ``stderr`` на Linux идёт посторонний шум подсистемы шрифтов — если показать
+        только его, отказ выглядит беспричинным (так и выглядел пакетный прогон по трём
+        настоящим хранилищам: три источника с кодом 1 и ни одного сообщения).
+        """
+        parts: list[str] = []
+        out_path = out_file_from_args(args)
+        if out_path:
+            # Файл уже прочитан вызывающим (там же принималось решение о типе ошибки) —
+            # второй раз его не читаем: к этому моменту он мог быть и убран.
+            reason = read_designer_out(out_path) if reason is None else reason
+            if reason:
+                parts.append(
+                    f"Сообщение конфигуратора ({out_path}):\n{reason[:OUT_EXCERPT_LIMIT]}"
+                )
+            else:
+                # Пустой файл — тоже факт: значит, конфигуратор не дошёл до записи причины.
+                parts.append(f"Файл сообщений конфигуратора пуст: {out_path}")
+        output = (result.stderr or result.stdout or "").strip()
+        if output:
+            parts.append(output[:OUT_EXCERPT_LIMIT])
+        return redact_text("\n".join(parts), secrets)

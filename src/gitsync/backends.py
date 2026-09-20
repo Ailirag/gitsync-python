@@ -13,7 +13,9 @@
 
 from __future__ import annotations
 
+import functools
 import logging
+import os
 import shutil
 import threading
 import time
@@ -26,7 +28,13 @@ from .designer import DesignerRunner, StorageAccess
 from .errors import CancelledError, GitSyncError, UnsafePathError
 from .locks import exclusive_lock
 from .repository_session import repository_session_path
-from .safepath import safe_join
+from .safepath import (
+    Identity,
+    directory_identity,
+    discard_owned_directory,
+    require_private_scratch,
+    safe_join,
+)
 from .storage_report import StorageVersion, parse_storage_report
 
 log = logging.getLogger("gitsync.backend")
@@ -42,6 +50,27 @@ class StorageBackend(Protocol):
         ...
 
 
+def _keeps_diagnostics_on_failure(method):
+    """Отказ сохраняет протоколы конфигуратора; успех и отмена — нет.
+
+    Причину отказа конфигуратор пишет ТОЛЬКО в файл ``/Out``, и текст ошибки ссылается
+    на путь этого файла («откройте протокол конфигуратора» — docs/setup-guide.md,
+    docs/docker-guide.md). Удалить его вместе с одноразовым состоянием значило бы
+    оборвать документированный разбор отказа. Отмена по запросу оператора отказом не
+    является: иначе каждая штатная остановка оставляла бы каталог на постоянном томе.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except CancelledError:
+            raise
+        except BaseException:
+            self._keep_diagnostics = True
+            raise
+    return wrapper
+
+
 class NativeStorageBackend:
     """Работа с настоящим хранилищем через конфигуратор 1С."""
 
@@ -52,6 +81,7 @@ class NativeStorageBackend:
         temp_root: str | Path,
         extension: str | None = None,
         ib_factory=None,
+        owns_temp_root: bool = False,
     ):
         self.access = access
         self._session_path = repository_session_path(access)
@@ -61,10 +91,55 @@ class NativeStorageBackend:
         # ib_factory(worker_dir) -> строка соединения с ИБ; по умолчанию файловая база.
         self.ib_factory = ib_factory or self._create_file_infobase
         self._local = threading.local()
-        self._worker_dirs: list[Path] = []
+        #: Рабочие каталоги вместе с удостоверением, снятым в момент создания: удаляют по
+        #: удостоверению, а не по пути — путь к моменту очистки может вести куда угодно.
+        self._worker_dirs: list[tuple[Path, Identity | None]] = []
+        #: Каталог запуска принадлежит ЭТОМУ запуску и снимается вместе с ним. Владение
+        #: подтверждается созданием, а не именем: каталог, переданный снаружи
+        #: (``owns_temp_root=False``), может быть общим или постоянным, и его не удаляют.
+        self.owns_temp_root = bool(owns_temp_root)
+        #: Каталог запуска ещё не создан: его создаёт первая настоящая работа, а не
+        #: построение бэкенда. Иначе прогон, упавший на подготовке репозитория (git
+        #: отказал, небезопасный путь, занятая цель), оставлял бы пустой каталог —
+        #: тот же неограниченный рост на постоянном томе, только инодами.
+        self._scratch_created = False
+        #: Удостоверение созданного каталога запуска и замок его первого создания:
+        #: «проверить флаг» и «создать каталог» — две операции, и одновременное первое
+        #: обращение нескольких потоков иначе отказывает всем, кроме одного.
+        self._scratch_identity: Identity | None = None
+        #: Рекурсивный: ``_worker_context`` держит замок и сам вызывает ``_ensure_scratch_root``.
+        self._scratch_lock = threading.RLock()
+        #: Диагностика отказа пережила очистку — каталог запуска оставлен намеренно.
+        self._keep_diagnostics = False
         if access.password:
             # Конфигуратор повторяет свои аргументы в сообщениях — вымарываем значение всюду.
             self.runner.secrets.append(access.password)
+
+    def _ensure_scratch_root(self) -> None:
+        """Готовит корень временных каталогов перед первой работой в нём.
+
+        Для собственного каталога запуска ``exist_ok=False`` — владение подтверждается
+        созданием: удалять можно только то, что создали сами. Создание идёт под замком:
+        первое обращение нескольких потоков сразу иначе даёт ``FileExistsError`` у всех,
+        кроме одного, — сам каталог при этом создан, и отказ получают работающие потоки.
+        Чужой (внешний или постоянный) корень лишь дополняется, но владельцем бэкенд не
+        становится.
+        """
+        # Договор контейнерной поставки (stage-18): общий том под каталогом запуска —
+        # отказ ДО создания и ДО любой уборки. Проверяются оба режима: и свой каталог,
+        # и переданный снаружи постоянный корень.
+        require_private_scratch(self.temp_root, "Каталог запуска бэкенда")
+        if not self.owns_temp_root:
+            self.temp_root.mkdir(parents=True, exist_ok=True)
+            return
+        with self._scratch_lock:
+            if self._scratch_created:
+                return
+            self.temp_root.mkdir(parents=True, exist_ok=False)
+            # Удостоверение снимается сразу после создания: позже путь можно подменить,
+            # а объект файловой системы — нет.
+            self._scratch_identity = directory_identity(self.temp_root)
+            self._scratch_created = True
 
     def _create_file_infobase(self, worker_dir: Path) -> str:
         """Создаёт пустую файловую базу для потока.
@@ -76,6 +151,9 @@ class NativeStorageBackend:
 
         Наличие базы проверяется по артефакту ``1Cv8.1CD`` — нулевой код возврата сам по себе
         недостаточен. Если база создана снаружи, передайте строку соединения через ``ib_factory``.
+
+        ``/Out`` обязателен и здесь: причину отказа конфигуратор пишет только в этот файл,
+        а это самый первый его запуск — без файла отказ на старте остался бы без объяснения.
         """
         base_dir = worker_dir / "ib"
         base_dir.mkdir(parents=True, exist_ok=True)
@@ -86,6 +164,8 @@ class NativeStorageBackend:
                 f"File={base_dir}",
                 "/DisableStartupDialogs",
                 "/DisableStartupMessages",
+                "/Out",
+                str(self.runner.out_file()),
             ]
         )
         if not (base_dir / "1Cv8.1CD").is_file():
@@ -100,9 +180,16 @@ class NativeStorageBackend:
         """
         context = getattr(self._local, "context", None)
         if context is None:
-            worker_dir = self.temp_root / f"worker-{uuid.uuid4().hex}"
-            worker_dir.mkdir(parents=True, exist_ok=False)
-            self._worker_dirs.append(worker_dir)
+            # Корень, свой каталог и запись о нём — под одним замком: иначе очистка,
+            # начатая между созданием каталога и записью о нём, снимает каталог и
+            # оставляет о нём запись, а поток продолжает работать в уже снятом каталоге.
+            # Создание ИБ (запуск конфигуратора) в замок не входит: оно долгое и чужим
+            # каталогам не мешает.
+            with self._scratch_lock:
+                self._ensure_scratch_root()
+                worker_dir = self.temp_root / f"worker-{uuid.uuid4().hex}"
+                worker_dir.mkdir(parents=True, exist_ok=False)
+                self._worker_dirs.append((worker_dir, directory_identity(worker_dir)))
             context = (worker_dir, self.ib_factory(worker_dir))
             if self.extension:
                 # Upstream СоздатьРасширениеВБазе: generic empty extension, not
@@ -116,13 +203,103 @@ class NativeStorageBackend:
         return context
 
     def cleanup(self) -> None:
-        """Удаляет ТОЛЬКО собственные рабочие каталоги (созданные этим экземпляром)."""
-        while self._worker_dirs:
-            shutil.rmtree(self._worker_dirs.pop(), ignore_errors=True)
-        self._local = threading.local()
+        """Удаляет ТОЛЬКО собственные каталоги — и только пока они остаются своими.
 
+        Одноразовое состояние (временные ИБ, полученные ``.cf``, отчёт) снимается всегда.
+        Каталог запуска целиком удаляется, только если его создал этот экземпляр и в нём
+        не осталось диагностики отказа. Общий родитель временных файлов не трогается:
+        им пользуются другие репозитории и параллельные запуски.
+
+        Удостоверение каталога запуска проверяется ДО удаления чего-либо внутри него:
+        рабочие каталоги лежат внутри, и по подменённому корню путь к каждому из них
+        ведёт уже в чужое дерево — подмену ПРЕДКА защита ``rmtree`` от ссылки на самом
+        удаляемом каталоге не ловит. Потеря владения — отказ от очистки: каталоги
+        остаются в списке, и следующая очистка проверит их заново.
+
+        Вызывать полагается ПОСЛЕ остановки пула: метод освобождает ресурсы всего
+        экземпляра, а не текущего потока, и одновременная работа другого потока в том же
+        каталоге запуска — не поддерживаемый порядок. Замок здесь не заменяет этого
+        порядка, а исключает разрыв учёта: пока очистка идёт, новый рабочий каталог не
+        может быть создан наполовину — созданным, но не записанным, или записанным, но
+        уже снятым.
+
+        Отклонённый рабочий каталог ЗАЩИЩАЕТСЯ от последующей уборки корня (stage-14,
+        S4b). Раньше отказ по удостоверению касался только самого каталога, а затем
+        рекурсивное снятие каталога запуска уносило подменённое содержимое вместе со всем
+        прочим: признали объект чужим — и тут же уничтожили. Теперь имя такого каталога
+        передаётся в ``protect``, корень остаётся непустым, и его снятие честно не
+        состоится.
+        """
+        with self._scratch_lock:
+            pending, self._worker_dirs = self._worker_dirs, []
+            self._local = threading.local()
+            if self._owned_root_lost():
+                self._worker_dirs = pending
+                return
+            refused: set[str] = set()
+            for worker_dir, identity in pending:
+                # stage-15, EVA-13: если вернуть перемещённое на исходное имя не удалось
+                # (оно занято), объект остаётся под временным именем изоляции. Это имя
+                # тоже обязано попасть под защиту: иначе уборка корня снесёт то, что мы
+                # только что отказались трогать.
+                left_behind: set[str] = set()
+                if not discard_owned_directory(worker_dir, identity, "Рабочий каталог",
+                                               displaced=left_behind):
+                    self._worker_dirs.append((worker_dir, identity))
+                    # Защищается ИМЯ внутри каталога запуска: снимать его нельзя ни
+                    # самому, ни заодно с родителем.
+                    if worker_dir.parent == self.temp_root:
+                        refused.add(worker_dir.name)
+                if worker_dir.parent == self.temp_root:
+                    refused |= left_behind
+            self._discard_scratch_root(refused)
+
+    def _owned_root_lost(self) -> bool:
+        """Каталог запуска перестал быть тем объектом, который создал этот запуск.
+
+        Исчезнувший каталог подменой не считается: внутри него удалять уже нечего, и
+        повторная очистка не имеет права тревожить журнал из-за прибранного тома.
+        """
+        if not self.owns_temp_root or not self._scratch_created:
+            return False
+        try:
+            os.lstat(self.temp_root)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            log.warning("Каталог запуска прочитать не удалось, очистка отменена: %s (%s)",
+                        self.temp_root, exc)
+            return True
+        if self._scratch_identity is not None \
+                and directory_identity(self.temp_root) == self._scratch_identity:
+            return False
+        log.warning("Каталог запуска перестал быть своим, очистка отменена: %s", self.temp_root)
+        return True
+
+    def _discard_scratch_root(self, protect: set[str] | None = None) -> None:
+        """Снимает собственный каталог запуска, если он больше ничего не значит.
+
+        ``protect`` — имена, принадлежность которых уже отклонена: их не снимает ни эта
+        уборка, ни рекурсия внутри неё.
+        """
+        if not self.owns_temp_root or not self._scratch_created:
+            return
+        if self._keep_diagnostics:
+            log.info("Протоколы конфигуратора оставлены для разбора отказа: %s", self.temp_root)
+            return
+        if protect:
+            log.warning("Каталог запуска не снимается целиком: внутри осталось отклонённое "
+                        "по удостоверению содержимое (%s): %s",
+                        ", ".join(sorted(protect)), self.temp_root)
+        if not discard_owned_directory(self.temp_root, self._scratch_identity,
+                                       "Каталог запуска", protect):
+            return
+        # Каталог снят — владение придётся подтверждать заново, если бэкенд ещё используют.
+        self._scratch_created = False
+        self._scratch_identity = None
+
+    @_keeps_diagnostics_on_failure
     def fetch_history(self, begin: int = 1) -> list[StorageVersion]:
-        self.temp_root.mkdir(parents=True, exist_ok=True)
         worker_dir, ib_connection = self._worker_context()
         # Отчёт конфигуратора — табличный документ (MOXCEL) независимо от расширения файла.
         report_path = worker_dir / f"storage-report-{uuid.uuid4().hex}.mxl"
@@ -136,6 +313,7 @@ class NativeStorageBackend:
             raise GitSyncError(f"Конфигуратор не создал отчёт по версиям: {report_path}")
         return parse_storage_report(report_path.read_bytes())
 
+    @_keeps_diagnostics_on_failure
     def export_version(self, version: int, dest: Path, cancel: threading.Event | None = None) -> None:
         """Версия хранилища → каталог XML.
 

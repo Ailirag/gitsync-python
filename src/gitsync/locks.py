@@ -22,7 +22,7 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
-from .errors import LockBusyError, UnsafePathError
+from .errors import LockAccessError, LockBusyError, UnsafePathError
 
 try:  # pragma: no cover — ветка выбирается платформой
     import fcntl
@@ -77,7 +77,20 @@ def exclusive_lock(path: str | Path, timeout: float = 30.0, poll: float = 0.05) 
 
     flags = os.O_CREAT | os.O_RDWR
     flags |= getattr(os, "O_NOFOLLOW", 0)  # POSIX: не идти по символьной ссылке
-    fd = os.open(str(lock_path), flags, 0o600)
+    try:
+        fd = os.open(str(lock_path), flags, 0o600)
+    except PermissionError as exc:
+        # Файл блокировки создаётся с правами 0600, поэтому чужой UID не может ни
+        # взять её, ни обойти — это защита, а не поломка. Наблюдалось в контейнерах:
+        # держатель с UID 10001 и второй контейнер с UID 12345 на общем томе.
+        # Без этой ветки наружу уходила трассировка PermissionError, по которой
+        # оператору непонятно ни что случилось, ни что делать.
+        raise LockAccessError(
+            f"Нет прав на файл блокировки <{lock_path}>: он принадлежит другому UID. "
+            "Ожидание тут не поможет — блокировка не занята, а недоступна. "
+            "Запускайте все обращения к одному хранилищу одной и той же парой UID:GID "
+            "(в контейнерах — одинаковый --user), либо дайте им разные каталоги сессий."
+        ) from exc
     try:
         while True:
             if _try_lock(fd):

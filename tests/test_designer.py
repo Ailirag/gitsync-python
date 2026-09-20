@@ -126,6 +126,13 @@ class _RecordingRunner:
         self.v8_path = "1cv8.exe"
         self.calls: list[list[str]] = []
         self.tmp_path = tmp_path
+        self.secrets: list[str] = []
+
+    def out_file(self):
+        # Часть контракта запускающего: конфигуратор пишет причину отказа только в /Out.
+        out_dir = Path(self.tmp_path) / "designer-out"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir / "out.log"
 
     def run(self, args, timeout=None):
         self.calls.append(list(args))

@@ -1,7 +1,8 @@
 # Матрица совместимости с oscript-library/gitsync
 
-Источник сравнения: `D:/hermes/cache/gitsync-upstream-20260915`, коммит
+Источник сравнения: https://github.com/oscript-library/gitsync, коммит
 `82d87f54942400362e3950d8190f9323bcb883c0` (19.07.2026, «bump version»), лицензия MPL-2.0.
+Сверка велась по локальной копии этого коммита.
 Изучены: `src/core/Классы/МенеджерСинхронизации.os` (1640 строк), `src/core/Классы/ПакетнаяСинхронизация.os`,
 `src/core/Классы/МенеджерПлагинов.os`, `src/core/Классы/internal/Классы/*` (плагины, подписки),
 `src/cmd/*` (команды CLI), `packagedef` (зависимости), `features/**` (BDD-тесты), `LICENSE`.
@@ -44,16 +45,20 @@
 
 | Операция | argv (upstream) | gitsync-py | Статус |
 |---|---|---|---|
-| База запуска | `DESIGNER`, ключ ИБ, `/Out <файл>`, `/L RU`, `/DisableStartupMessages`, `/DisableStartupDialogs` | `DesignerRunner.base_args` | не проверено на живой платформе |
-| Отчёт по версиям | `/ConfigurationRepositoryF`, `/ConfigurationRepositoryN`, `/ConfigurationRepositoryP`, `/ConfigurationRepositoryReport <файл>`, `-NBegin N`, `-NEnd N` | `build_report_args` | не проверено |
+| База запуска | `DESIGNER`, ключ ИБ, `/Out <файл>`, `/L RU`, `/DisableStartupMessages`, `/DisableStartupDialogs` | `DesignerRunner.base_args` | проверено на живой платформе 8.3.27.2130; [приёмка](VERIFIED_STATUS.md) |
+| Отчёт по версиям | `/ConfigurationRepositoryF`, `/ConfigurationRepositoryN`, `/ConfigurationRepositoryP`, `/ConfigurationRepositoryReport <файл>`, `-NBegin N`, `-NEnd N` | `build_report_args` | проверен рабочий маршрут Report для файлового и TCP-хранилища, не все сочетания параметров; [TCP-отчёт](SERVER_STORAGE_CHECK_RU.md) |
 | Получение версии | `/ConfigurationRepositoryUpdateCfg`, **затем** `-v N`, `-force` | `build_update_cfg_args` (порядок закреплён тестом) | не проверено |
-| Выгрузка в файлы | `/DumpConfigToFiles <кат> -format Hierarchical` | `build_dump_args` | не проверено |
-| Выгрузка расширения | `-Extension <имя>` либо `-AllExtensions` | `build_dump_args(extension=...)` | не проверено |
+| Выгрузка в файлы | `/DumpConfigToFiles <кат> -format Hierarchical` | `build_dump_args` | проверено: XML 17/17 версий сверены с независимым эталоном |
+| Выгрузка расширения | `-Extension <имя>` либо `-AllExtensions` | `build_dump_args(extension=...)` | два именованных расширения проверены; `-AllExtensions` отдельно не проверен |
 | Форсирование `/L RU` для истории хранилища | `ПолучитьХранилищеКонфигурации` (комментарий «Костыль выгрузки истории») | `DesignerRunner(language="RU")` | есть |
 | Маскирование `/P` и `/ConfigurationRepositoryP` в логах | `ЗапуститьИПодождать` | `designer.mask_secrets` (+ в тексте исключений) | есть, расширено |
 | Передача аргументов | строка, на Linux через `sh -c '...'` | **массив argv, без shell** | намеренно отличается |
 | `-update`/`-force` инкрементальная выгрузка (8.3.10+) | `ВыгрузитьКонфигурациюВФайлы` | **нет** | нет |
-| Создание временной базы | `/ConfigurationRepositoryCreate`, `CREATEINFOBASE` | `NativeStorageBackend._create_file_infobase` | не проверено |
+| Создание временной базы | `/ConfigurationRepositoryCreate`, `CREATEINFOBASE` | `NativeStorageBackend._create_file_infobase` | `CREATEINFOBASE` проверен в native-маршруте; создание серверного хранилища этой приёмкой не покрыто |
+
+Текущий native-маршрут получает версию через `ConfigurationRepositoryDumpCfg -v N`,
+затем выполняет отдельные `LoadCfg` и `DumpConfigToFiles`. Эта живая приёмка не
+доказывает работу альтернативного `ConfigurationRepositoryUpdateCfg` из таблицы.
 
 ### Разбор отчёта по версиям — честная оговорка
 

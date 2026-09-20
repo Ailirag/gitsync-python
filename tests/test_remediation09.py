@@ -19,10 +19,15 @@ fixture_storage = _fixture_storage
 @pytest.mark.parametrize('cleanup_failure', ['none', 'run', 'backend', 'both'])
 def test_after_sync_failure_cleans_owned_resources(tmp_path, fixture_storage, monkeypatch,
                                                  cleanup_failure):
-    import shutil
     from pathlib import Path
 
-    original_rmtree = shutil.rmtree
+    import gitsync.sync as sync_module
+
+    # Шов сдвинут на снятие каталога выгрузки в самом менеджере: fix18 удаляет каталог не
+    # по пути (`shutil.rmtree`), а по удостоверению созданного объекта, и внутрь уходят
+    # уже имена вложенных каталогов. Проверяемое поведение то же: одна попытка снятия
+    # после остановки пула, отказ попадает в результат, чужое в общем родителе цело.
+    original_discard = sync_module.discard_owned_directory
     attempts = []
 
     def remove(path, *args, **kwargs):
@@ -30,9 +35,9 @@ def test_after_sync_failure_cleans_owned_resources(tmp_path, fixture_storage, mo
             attempts.append(path)
             if cleanup_failure in ('run', 'both'):
                 raise OSError('run cleanup failure')
-        return original_rmtree(path, *args, **kwargs)
+        return original_discard(path, *args, **kwargs)
 
-    monkeypatch.setattr(shutil, 'rmtree', remove)
+    monkeypatch.setattr(sync_module, 'discard_owned_directory', remove)
     shared = tmp_path / 'shared'
     (shared / 'foreign' / 'empty').mkdir(parents=True)
     (shared / 'foreign' / 'keep').write_bytes(b'FOREIGN')
@@ -92,7 +97,7 @@ def test_after_sync_failure_cleans_owned_resources(tmp_path, fixture_storage, mo
     with exclusive_lock(work / '.git' / 'gitsync-py.lock', timeout=0):
         pass
     durable_head = repo.head_sha()
-    monkeypatch.setattr(shutil, 'rmtree', original_rmtree)
+    monkeypatch.setattr(sync_module, 'discard_owned_directory', original_discard)
     recovery = SyncManager(work, FixtureStorageBackend(fixture_storage),
                            SyncOptions(limit=1, temp_root=shared)).sync()
     assert recovery.committed == [2]
