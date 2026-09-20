@@ -132,14 +132,15 @@ def test_shared_lock_volume_is_external_and_documented():
     assert "одним UID" in guide, "требование одного UID обязано быть в руководстве"
 
 
-def test_guide_does_not_claim_the_unverified_native_path_works():
+def test_guide_scopes_native_acceptance_to_the_verified_stand():
     guide = _text(GUIDE)
-    assert "НЕ ПРОВЕРЕНО" in guide
-    # Раздел про образ с платформой обязан быть помечен как невыполненный.
+    assert "ПРОВЕРЕНО на стенде" in guide
+    assert "SERVER_STORAGE_CHECK_RU.md" in guide
+    assert "17/17" in guide
     native_section = guide.split("## 10.")[1].split("## 12.")[0]
-    assert "не запускалась" in native_section or "не выполнялся" in native_section
-    assert "Dockerfile.native" in _text(DOCKERFILE_NATIVE)
-    assert "НЕ ПРОВЕРЕНО" in _text(DOCKERFILE_NATIVE)
+    assert "Исторический отказ и текущий статус" in native_section
+    assert "Лицензирование вашей среды остаётся задачей её владельца" in native_section
+    assert "НЕ ПРОВЕРЕНО" not in guide.split("### Что проверено, а что нет")[1].split("### Чем контейнер")[0]
 
 
 def test_runtime_image_never_copies_tests_or_history():

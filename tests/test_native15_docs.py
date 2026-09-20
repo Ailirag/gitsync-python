@@ -70,5 +70,7 @@ def test_guide_requires_writable_home_for_the_font_cache(guide):
 
 
 def test_guide_does_not_promise_native_storage_work_without_a_license(guide):
-    """Проверка честности: раздел про хранилище по-прежнему не объявлен пройденным."""
-    assert "НЕ ПРОВЕРЕНО" in guide
+    """Живая приёмка не заменяет лицензию и проверку среды пользователя."""
+    assert "реальные выгрузки файловых и серверных хранилищ" in guide
+    assert "Лицензирование вашей среды остаётся задачей её владельца" in guide
+    assert "SERVER_STORAGE_CHECK_RU.md" in guide
